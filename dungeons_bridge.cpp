@@ -474,6 +474,20 @@ static bool TryReadComparisonIndex(void* objPtr, int32_t& outIndex)
     }
 }
 
+static bool TryReadFunctionFlags(void* functionPtr, uint32_t& outFlags)
+{
+    __try
+    {
+        uintptr_t obj = reinterpret_cast<uintptr_t>(functionPtr);
+        outFlags = *reinterpret_cast<uint32_t*>(obj + 0x98);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
 static bool TryReadClassPtr(void* objPtr, void*& outClassPtr)
 {
     __try
@@ -1921,6 +1935,59 @@ static void TryHookInteractFunction(void* function)
     if (TryGetObjectName(function, funcName) && funcName.find("Highlight") != std::string::npos)
         return;
 
+    // CRITICAL FILTER - added after a real session's debug log showed
+    // MH_CreateHook failing with MH_ERROR_ALREADY_CREATED (status 3) on
+    // the SAME handful of function names dozens of times each (e.g.
+    // "BndEvt__ReplicatedInteractable_K2Node_ComponentBoundEvent_0_
+    // OnInteract__DelegateSignature" alone failed 72 times). Root cause:
+    // pure Blueprint-graph functions (no native C++ implementation) do
+    // NOT get their own compiled ExecFunction thunk - they all share the
+    // SAME generic Blueprint-VM interpreter entry point. The first one
+    // hooked successfully then intercepts EVERY Blueprint function call
+    // in the entire game that routes through that shared interpreter,
+    // not just Interact-family ones - this is what caused the freezes
+    // and the crash during level-load transitions (massive overhead +
+    // wrong-context blocking checks on unrelated Blueprint calls).
+    //
+    // Fix: only hook UFunctions with the Native flag set (EFunctionFlags
+    // ::Native = 0x400, confirmed via the Dumper-7 dump's Basic.hpp;
+    // FunctionFlags itself confirmed at UFunction+0x98). Only native
+    // functions get a unique, individually-compiled thunk safe to hook
+    // this way.
+    //
+    // KNOWN CONSEQUENCE: the actual pickup/chest OnInteracted bound-event
+    // functions are themselves pure Blueprint graphs (that's exactly what
+    // was colliding above) - this filter means NONE of them get hooked
+    // anymore, so progressive pickup-tier blocking goes back to not
+    // functioning, in exchange for the game no longer freezing/crashing.
+    // This is a real regression, not a side effect to ignore - it needs
+    // a genuinely different mechanism (e.g. one single hook on the
+    // shared interpreter address itself, filtering by reading FFrame::
+    // Node inside it to identify which specific function is executing
+    // before deciding whether to block - NOT implemented here, since
+    // FFrame's layout isn't in this SDK dump and needs its own
+    // confirmed offset before it's safe to try) rather than resurrecting
+    // this per-function approach for Blueprint-graph functions.
+    uint32_t functionFlags = 0;
+    if (!TryReadFunctionFlags(function, functionFlags))
+        return;
+    constexpr uint32_t FUNC_Native = 0x00000400;
+    if (!(functionFlags & FUNC_Native))
+        return;  // pure Blueprint graph - shares the generic VM thunk, not safe to hook individually
+
+    // Mark as attempted BEFORE the actual hook attempt, covering every
+    // return path below (success or failure) - not just success like
+    // before. The old version only added to g_execHookedFunctions on
+    // success, so a failed attempt (e.g. MH_CreateHook returning
+    // ALREADY_CREATED for a genuine collision) got retried on every
+    // single 10s re-sweep forever, spamming the log with the same
+    // failure hundreds of times over a session (confirmed: 244
+    // "exhausted"/failure log lines in one real session alone).
+    {
+        std::lock_guard<std::mutex> lock(g_execHookedMutex);
+        g_execHookedFunctions.insert(function);
+    }
+
     size_t slot = g_execHookCount.fetch_add(1, std::memory_order_relaxed);
     if (slot >= MAX_EXEC_HOOKS)
     {
@@ -1931,7 +1998,10 @@ static void TryHookInteractFunction(void* function)
 
     void* execFuncAddr = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(function) + 0xC0);
     if (!execFuncAddr)
-        return;  // no native thunk assigned (e.g. pure-BP-graph function with no compiled exec) - nothing to hook
+    {
+        g_execHookCount.fetch_sub(1, std::memory_order_relaxed);  // slot never used - give it back
+        return;  // no native thunk assigned - nothing to hook
+    }
 
     void* original = nullptr;
     MH_STATUS createStatus = MH_CreateHook(execFuncAddr, reinterpret_cast<void*>(g_execStubTable[slot]), &original);
@@ -1939,6 +2009,7 @@ static void TryHookInteractFunction(void* function)
     {
         LogLine("TryHookInteractFunction: MH_CreateHook failed (" + std::to_string(static_cast<int>(createStatus)) +
                 ") for " + funcName);
+        g_execHookCount.fetch_sub(1, std::memory_order_relaxed);  // slot never used - give it back
         return;
     }
     MH_STATUS enableStatus = MH_EnableHook(execFuncAddr);
@@ -1946,14 +2017,14 @@ static void TryHookInteractFunction(void* function)
     {
         LogLine("TryHookInteractFunction: MH_EnableHook failed (" + std::to_string(static_cast<int>(enableStatus)) +
                 ") for " + funcName);
+        // NOT giving the slot back here - MH_CreateHook DID succeed, so a
+        // real trampoline now exists at g_execStubTable[slot]'s target
+        // even though enabling failed; reusing this slot for a different
+        // function would be unsafe. Rare path, acceptable one-slot loss.
         return;
     }
 
     g_execOriginal[slot].store(reinterpret_cast<ExecFunctionPtr>(original), std::memory_order_relaxed);
-    {
-        std::lock_guard<std::mutex> lock(g_execHookedMutex);
-        g_execHookedFunctions.insert(function);
-    }
     LogLine("Hooked Interact-family ExecFunction (slot " + std::to_string(slot) + "): " + funcName);
 }
 
