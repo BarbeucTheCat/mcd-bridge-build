@@ -2434,7 +2434,7 @@ void SetupHookThread()
     // OnOpenLootChest-style classification stop working while this is set
     // to 1 - expected and fine for a short isolation-test session, not a
     // permanent trade-off.
-#define ISOLATION_TEST_SKIP_PROCESSEVENT_HOOK 0
+#define ISOLATION_TEST_SKIP_PROCESSEVENT_HOOK 1
 #if ISOLATION_TEST_SKIP_PROCESSEVENT_HOOK
     LogLine("ISOLATION TEST: skipping ProcessEvent hook installation entirely.");
 #else
