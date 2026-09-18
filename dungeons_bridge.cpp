@@ -48,8 +48,6 @@
 #include <sstream>
 #include <functional>
 #include <atomic>
-#include <array>
-#include <utility>
 
 #include "MinHook.h"
 
@@ -79,20 +77,7 @@ static const wchar_t* GetPipeName()
     return g_pipeName.c_str();
 }
 
-// ---- Per-distribution-channel offsets - same split/rationale as
-// dungeons_reader.py's STORE_OFFSETS (see that dict's own comment for
-// why only these two of the four - GObjects/GWorld there, plus
-// AppendString/ProcessEvent here since those two are ALSO RVAs into the
-// same binary and equally exposed to the same drift - are split out per
-// channel rather than the whole file's worth of game-logic offsets:
-// a systematic audit against fresh Dumper-7 dumps found every other
-// offset in this file unchanged across a real game update, so only
-// these four get the "might differ" treatment). Runtime-selected
-// (instead of constexpr, like before this split) by ReadGameStoreConfig
-// at DLL load, from the SAME game_store.json in DATA_DIR that
-// dungeons_reader.py's /set_store command writes - both sides read one
-// shared, absolute-path config file, so setting the channel once in
-// either place covers both.
+// ---- Copied directly from the real Dumper-7 Basic.hpp - not guessed ----
 namespace Offsets
 {
     struct OffsetSet
@@ -103,89 +88,32 @@ namespace Offsets
         int32_t GWorld;
     };
 
-    // "steam" - confirmed via a real Dumper-7 dump (hash UE4CC-Windows-
-    // 48B0567B4722BB43C30D8BA0C8D0194E), 2026-09-02.
-    constexpr OffsetSet Steam = { 0x04696848, 0x010C19A0, 0x01246E10, 0x04795230 };
-
-    // "minecraft_launcher" (standalone Minecraft Launcher/Xbox app build)
-    // - CONFIRMED via a real Dumper-7 dump of this build's Basic.hpp.
-    // Matches the same pre-update values as Microsoft Store below - this
-    // channel also hasn't received the update Steam's channel got.
+    // "steam" received a game update that moved these RVAs - confirmed via
+    // a fresh Dumper-7 dump of the updated binary. "microsoft_store" and
+    // "minecraft_launcher" are both still on the OLDER, pre-update build
+    // (the values this whole namespace used to hardcode unconditionally),
+    // confirmed via their own separate Dumper-7 dumps.
+    constexpr OffsetSet Steam         = { 0x04696848, 0x010C19A0, 0x01246E10, 0x04795230 };
     constexpr OffsetSet MinecraftLauncher = { 0x046556C8, 0x010BF7C0, 0x01244C30, 0x047540B0 };
+    constexpr OffsetSet MsStore       = { 0x046556C8, 0x010BF7C0, 0x01244C30, 0x047540B0 };
 
-    // "microsoft_store" (Microsoft Store build) - CONFIRMED via a real
-    // Dumper-7 dump of this build's Basic.hpp (2026-09-05). Matches the
-    // ORIGINAL Steam values from before that channel's game update -
-    // Microsoft Store is simply still on that older build.
-    constexpr OffsetSet MsStore = { 0x046556C8, 0x010BF7C0, 0x01244C30, 0x047540B0 };
-
-    static OffsetSet Active = Steam;  // overwritten by ReadGameStoreConfig before any hook installs
+    // Mutable at runtime - set once by ReadGameStoreConfig() during
+    // SetupHookThread, before any of these offsets are actually used.
+    // Defaults to Steam; ReadGameStoreConfig overwrites this from
+    // game_store.json (the same file dungeons_reader.py's
+    // load_game_store()/save_game_store() read and write) if present.
+    // This DLL previously hardcoded a single OffsetSet unconditionally
+    // (matching only Microsoft Store/Minecraft Launcher) while
+    // dungeons_reader.py already had full per-store support - meaning a
+    // Steam player's Python side correctly selected Steam's offsets while
+    // this DLL silently kept using the wrong ones regardless, hooking
+    // ProcessEvent/AppendString/GObjects at addresses that don't
+    // correspond to Steam's actual binary layout at all. That mismatch is
+    // a strong candidate for crashes on any storefront other than the one
+    // these values happened to be hardcoded for.
+    static OffsetSet Active = Steam;
 }
 
-// Forward declaration - LogLine itself is defined further below, but
-// ReadGameStoreConfig (which needs to log its result) runs earlier in
-// the file than that, right alongside the Offsets it configures.
-static void LogLine(const std::string& line);
-
-// Same absolute path dungeons_ap_client.py's DATA_DIR resolves to
-// (%LOCALAPPDATA%\MCDungeonsAP) - previously hardcoded to a
-// C:\ProgramData\Archipelago\... path that DATA_DIR never actually was,
-// which meant this always reported "not found" regardless of what the
-// Python side wrote, silently defaulting to Steam offsets even when
-// /set_store microsoft_store had been run. game_store.json itself is
-// written by dungeons_reader.py's save_game_store()/the /set_store
-// client command - this only ever READS it.
-static void ReadGameStoreConfig()
-{
-    char localAppData[MAX_PATH] = {};
-    DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", localAppData, MAX_PATH);
-    std::string path = (len > 0 && len < MAX_PATH)
-        ? std::string(localAppData) + "\\MCDungeonsAP\\game_store.json"
-        : "C:\\ProgramData\\Archipelago\\MCDungeonsAP\\game_store.json"; // fallback only if the env var is somehow missing
-    FILE* f = nullptr;
-    fopen_s(&f, path.c_str(), "r");
-    if (!f)
-    {
-        LogLine("game_store.json not found - defaulting to 'steam' offsets.");
-        return;
-    }
-    char buf[256] = {};
-    fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
-    std::string contents(buf);
-
-    // Minimal, dependency-free parse - just enough to find "store":"<value>"
-    // in the small flat JSON object save_game_store() writes ({"store":
-    // "steam"}), without pulling in a real JSON library for one field.
-    size_t keyPos = contents.find("\"store\"");
-    if (keyPos == std::string::npos)
-    {
-        LogLine("game_store.json found but couldn't parse it - defaulting to 'steam' offsets.");
-        return;
-    }
-    size_t firstQuote = contents.find('"', contents.find(':', keyPos) + 1);
-    size_t secondQuote = (firstQuote == std::string::npos) ? std::string::npos
-                                                             : contents.find('"', firstQuote + 1);
-    if (firstQuote == std::string::npos || secondQuote == std::string::npos)
-    {
-        LogLine("game_store.json found but couldn't parse it - defaulting to 'steam' offsets.");
-        return;
-    }
-    std::string store = contents.substr(firstQuote + 1, secondQuote - firstQuote - 1);
-
-    if (store == "steam")
-        Offsets::Active = Offsets::Steam;
-    else if (store == "minecraft_launcher")
-        Offsets::Active = Offsets::MinecraftLauncher;
-    else if (store == "microsoft_store")
-        Offsets::Active = Offsets::MsStore;
-    else
-    {
-        LogLine("game_store.json has unrecognized store '" + store + "' - defaulting to 'steam' offsets.");
-        return;
-    }
-    LogLine("Game store: '" + store + "'");
-}
 
 
 struct FUObjectItem
@@ -277,23 +205,70 @@ static std::string GetLogPath()
 static void LogLine(const std::string& line)
 {
     std::lock_guard<std::mutex> lock(g_logMutex);
-    // Truncate on the FIRST write of this DLL load (fresh file per game
-    // session) instead of appending forever across every past session -
-    // an old session's leftover lines being mistaken for the current
-    // one's output was directly confirmed causing real debugging
-    // confusion (a stale log with no fresh hook-firing evidence looked
-    // identical to "the hook genuinely isn't firing this session").
-    // Every OTHER write within this same session still appends, same as
-    // before - this only resets the file boundary at load time.
-    static bool truncated = false;
     FILE* f = nullptr;
-    fopen_s(&f, GetLogPath().c_str(), truncated ? "a" : "w");
-    truncated = true;
+    fopen_s(&f, GetLogPath().c_str(), "a");
     if (f)
     {
-        fprintf(f, "%s\n", line.c_str());
+        // PID + timestamp on every single line - this file accumulates
+        // across every launch/relaunch forever (never rotated/cleared),
+        // and correlating a specific crash dump's PID/SecondsSinceStart
+        // against "which of these many SetupHookThread sessions was it"
+        // has repeatedly cost real diagnostic time this project. Cheap
+        // to always include, so no reason it should ever be optional.
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        fprintf(f, "[PID=%lu %04d-%02d-%02d %02d:%02d:%02d.%03d] %s\n",
+                GetCurrentProcessId(), st.wYear, st.wMonth, st.wDay,
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                line.c_str());
         fclose(f);
     }
+}
+
+// Same absolute path dungeons_ap_client.py's DATA_DIR and
+// dungeons_reader.py's GAME_STORE_FILE both resolve to
+// (%LOCALAPPDATA%\MCDungeonsAP\game_store.json). Only ever READS this
+// file - it's written by dungeons_reader.py's save_game_store()/the
+// /set_store client command. Must run before ANY Offsets::Active usage.
+static void ReadGameStoreConfig()
+{
+    char localAppData[MAX_PATH] = {};
+    DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", localAppData, MAX_PATH);
+    std::string path = (len > 0 && len < MAX_PATH)
+        ? std::string(localAppData) + "\\MCDungeonsAP\\game_store.json"
+        : "";
+    std::string store = "steam";
+    if (!path.empty())
+    {
+        FILE* f = nullptr;
+        fopen_s(&f, path.c_str(), "rb");
+        if (f)
+        {
+            char buf[256] = {};
+            size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+            fclose(f);
+            std::string content(buf, n);
+            // Minimal hand-rolled parse - avoids pulling in a JSON library
+            // for one string field. Looks for "store": "<value>".
+            size_t keyPos = content.find("\"store\"");
+            if (keyPos != std::string::npos)
+            {
+                size_t colonPos = content.find(':', keyPos);
+                size_t firstQuote = content.find('"', colonPos + 1);
+                size_t secondQuote = (firstQuote != std::string::npos)
+                    ? content.find('"', firstQuote + 1) : std::string::npos;
+                if (firstQuote != std::string::npos && secondQuote != std::string::npos)
+                    store = content.substr(firstQuote + 1, secondQuote - firstQuote - 1);
+            }
+        }
+    }
+    LogLine("Game store: '" + store + "'");
+    if (store == "minecraft_launcher")
+        Offsets::Active = Offsets::MinecraftLauncher;
+    else if (store == "microsoft_store")
+        Offsets::Active = Offsets::MsStore;
+    else
+        Offsets::Active = Offsets::Steam;
 }
 
 static uintptr_t GetImageBase()
@@ -306,110 +281,7 @@ static uint64_t GetCurrentWorldPtr()
     // Read directly - this code runs INSIDE the target process (injected),
     // so no cross-process ReadProcessMemory is needed, unlike pymem's
     // out-of-process reads of this exact same global on the Python side.
-    // __try-wrapped (POD-only, no std:: types in scope, safe under C2712)
-    // since this is now called on every single ProcessEvent - Offsets::
-    // Active.GWorld pointing at genuinely unmapped memory (not just a
-    // implausible-but-mapped value like -1) would otherwise crash this
-    // read directly, on every single call, rather than just returning a
-    // value IsPlausiblePointer can reject.
-    __try
-    {
-        return *reinterpret_cast<uint64_t*>(GetImageBase() + Offsets::Active.GWorld);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return 0;
-    }
-}
-
-// Same plausibility bound as dungeons_reader.py's _is_plausible_pointer -
-// confirmed live via /find_gamebp that GWorld reads back as -1 (every
-// byte 0xFF, not a real pointer) during at least one real transitional
-// window. Used below to extend the classification gate past just the
-// initial boot check.
-static bool IsPlausiblePointer(uint64_t value)
-{
-    return value > 0x10000 && value < 0x7FFFFFFFFFFFull;
-}
-
-// PersistentLevel check (UWorld+0x30) - confirmed offset, same chain as
-// dungeons_reader.py's documented THE FULL CHAIN comment. Added
-// specifically for a crash occurring even EARLIER than any scenario
-// HasLocalPawn/the GObjects-count gate already covered: confirmed live at
-// SecondsSinceStart=0, before the main menu even appears. At that point
-// GObjects is already huge (244399, comfortably past the 50000 floor -
-// the engine loads enormous numbers of internal classes during boot,
-// long before showing anything, so a raw count alone can't distinguish
-// "boot" from "real gameplay" this early) and GWorld/GameInstance/Pawn
-// can all apparently already point at transient boot-time objects that
-// pass IsPlausiblePointer without being a real, playable world. A
-// genuinely playable UWorld always has a valid PersistentLevel; an
-// early transient/placeholder UWorld during boot is a much better bet
-// not to. __try-wrapped for the same reason every other native read
-// here is - POD-only, no std:: types in scope.
-static bool HasPersistentLevel()
-{
-    __try
-    {
-        uint64_t world = GetCurrentWorldPtr();
-        if (!IsPlausiblePointer(world))
-            return false;
-
-        uint64_t persistentLevel = *reinterpret_cast<uint64_t*>(world + 0x30);
-        return IsPlausiblePointer(persistentLevel);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-}
-
-// GWorld -> GameInstance -> LocalPlayers[0] -> PlayerController -> Pawn,
-// same chain and same confirmed-working offsets as dungeons_reader.py's
-// get_pawn() (0x160/0x38/0x30/0x360) - NOT a new Dumper-7 lookup, just
-// porting an already-proven chain natively so this DLL can ask "does a
-// real Pawn exist yet" itself, the same precondition give_item.py's own
-// safety stack already gates on before granting anything. Every hop is
-// read via a raw pointer + IsPlausiblePointer check (mirroring
-// _is_plausible_pointer's role on the Python side) rather than a bare
-// null check, for the same reason GetCurrentWorldPtr needed it: a hop
-// reading back as a sentinel-like garbage value (e.g. -1) would
-// otherwise pass a naive truthy check and crash further down the chain.
-// __try-wrapped as a whole (POD-only - no std:: types in scope) so an
-// unmapped read at any hop returns "no Pawn" cleanly instead of
-// crashing, matching every other native read in this file.
-static bool HasLocalPawn()
-{
-    __try
-    {
-        uint64_t world = GetCurrentWorldPtr();
-        if (!IsPlausiblePointer(world))
-            return false;
-
-        uint64_t gameInstance = *reinterpret_cast<uint64_t*>(world + 0x160);
-        if (!IsPlausiblePointer(gameInstance))
-            return false;
-
-        uint64_t localPlayersData = *reinterpret_cast<uint64_t*>(gameInstance + 0x38);
-        int32_t localPlayersCount = *reinterpret_cast<int32_t*>(gameInstance + 0x38 + 0x8);
-        if (!IsPlausiblePointer(localPlayersData) || localPlayersCount < 1)
-            return false;
-
-        uint64_t localPlayer = *reinterpret_cast<uint64_t*>(localPlayersData);
-        if (!IsPlausiblePointer(localPlayer))
-            return false;
-
-        uint64_t playerController = *reinterpret_cast<uint64_t*>(localPlayer + 0x30);
-        if (!IsPlausiblePointer(playerController))
-            return false;
-
-        uint64_t pawn = *reinterpret_cast<uint64_t*>(playerController + 0x360);
-        return IsPlausiblePointer(pawn);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
+    return *reinterpret_cast<uint64_t*>(GetImageBase() + Offsets::Active.GWorld);
 }
 
 static TUObjectArray* GetGObjects()
@@ -431,6 +303,28 @@ static ProcessEventFn GetProcessEventFn()
 
 static bool TryResolveName(int32_t comparisonIndex, wchar_t* outBuffer, int32_t bufferSize, int32_t& outLen)
 {
+    // Preventive sanity check added after a crash traced (via a symbolized
+    // dump - see this function's __try below, which is confirmed NOT
+    // sufficient on its own) to this exact call into the game's own
+    // AppendString. Root cause unconfirmed - comparisonIndex is a plain
+    // int32_t that arrived over the pipe from a class_name_index gathered
+    // during an earlier GObjects scan, so a corrupted read anywhere
+    // upstream (the very kind of thing the zone-transition GObjects-walk
+    // hardening elsewhere in this file targets) could hand this function
+    // outright garbage. What IS confirmed: when the game's own crash
+    // reporter (the "UE4CC" dumps) intercepts an exception raised inside
+    // Unreal's own code before this function's local __except gets a
+    // chance, the __except below cannot prevent the crash - it can only
+    // catch exceptions that are still live by the time SEH unwinding
+    // reaches this frame. A garbage index is exactly the kind of input
+    // that should never reach AppendString in the first place, independent
+    // of whether __except could have caught its consequences - this bound
+    // is deliberately generous (FNamePool blocks cap at FNAME_MAX_BLOCKS
+    // shifted by FNAME_BLOCK_OFFSET_BITS elsewhere in this file), just
+    // enough to reject obviously-impossible values.
+    if (comparisonIndex < 0 || comparisonIndex >= (8192 << 16))
+        return false;
+
     __try
     {
         SimpleFName name{ comparisonIndex, 0 };
@@ -460,12 +354,22 @@ static bool TryReadOuterAndCount(void* objPtr, uintptr_t& outOuter, int32_t& out
     }
 }
 
-static bool TryReadComparisonIndex(void* objPtr, int32_t& outIndex)
+// Added after a beta tester's crash during a full-GObjects scan
+// (FindObjectsWithOuter, used by find_function_on_class's class-hierarchy
+// walk) - the per-object dereference inside the scan loop
+// (TryReadOuterAndCount above) was already protected, but the array-walk
+// machinery itself (GetGObjects()->Num(), ->GetByIndex()) was not. During a
+// zone transition, this engine tears down and recreates a large chunk of
+// its object graph in one burst (see the earlier discussion of loading-
+// screen instability) - the chunk array TUObjectArray::Objects can itself
+// be mid-reallocation/resize at exactly the moment a full scan is walking
+// it, and unlike an individual object's fields, that's not something a
+// per-element __try alone protects against.
+static bool TryGetGObjectsCount(TUObjectArray* arr, int32_t& outNum)
 {
     __try
     {
-        uintptr_t obj = reinterpret_cast<uintptr_t>(objPtr);
-        outIndex = *reinterpret_cast<int32_t*>(obj + 0x18);
+        outNum = arr->Num();
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -474,12 +378,130 @@ static bool TryReadComparisonIndex(void* objPtr, int32_t& outIndex)
     }
 }
 
-static bool TryReadFunctionFlags(void* functionPtr, uint32_t& outFlags)
+// Sentinel-aware plausibility check - a bare `if (ptr)` truthy check
+// misses -1/all-0xFF sentinel values (confirmed as a real, recurring
+// failure mode of GWorld and similar globals during zone transitions),
+// since -1 is truthy. Also rejects tiny values that are never real heap/
+// image pointers (catches 0/1/2/etc-style garbage without needing a
+// real address-range check).
+static bool IsPlausiblePointer(uint64_t ptr)
+{
+    return ptr > 0x10000 && ptr != static_cast<uint64_t>(-1);
+}
+
+// PersistentLevel check (UWorld+0x30, confirmed offset - same chain
+// dungeons_reader.py documents and uses for the same purpose). Added
+// for a crash confirmed occurring even before the main menu appears,
+// when GObjects is already large (the engine loads huge numbers of
+// internal classes during boot, long before showing anything) and
+// GWorld/Pawn can individually look plausible without representing a
+// genuinely playable world. A real UWorld always has a PersistentLevel;
+// an early boot-time placeholder is a much safer bet not to.
+static bool HasPersistentLevel()
 {
     __try
     {
-        uintptr_t obj = reinterpret_cast<uintptr_t>(functionPtr);
-        outFlags = *reinterpret_cast<uint32_t*>(obj + 0x98);
+        uint64_t world = GetCurrentWorldPtr();
+        if (!IsPlausiblePointer(world))
+            return false;
+        uint64_t persistentLevel = *reinterpret_cast<uint64_t*>(world + 0x30);
+        return IsPlausiblePointer(persistentLevel);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// GWorld -> GameInstance -> LocalPlayers[0] -> PlayerController -> Pawn,
+// same chain and same confirmed-working offsets as dungeons_reader.py's
+// get_pawn() (0x160/0x38/0x30/0x360) - not a new lookup, just porting an
+// already-proven chain natively. Added for a crash occurring specifically
+// at the main-menu/character-select screen: that screen already has
+// plenty of its own UI UObjects loaded (past any GObjects-count floor)
+// and its own valid (if not gameplay-relevant) UWorld+PersistentLevel,
+// so neither check above catches that window on its own - both pass
+// happily before a character is even picked. __try-wrapped as a whole
+// (POD-only) so an unmapped read at any hop returns "no Pawn" cleanly.
+static bool HasLocalPawn()
+{
+    __try
+    {
+        uint64_t world = GetCurrentWorldPtr();
+        if (!IsPlausiblePointer(world))
+            return false;
+        uint64_t gameInstance = *reinterpret_cast<uint64_t*>(world + 0x160);
+        if (!IsPlausiblePointer(gameInstance))
+            return false;
+        uint64_t localPlayersData = *reinterpret_cast<uint64_t*>(gameInstance + 0x38);
+        if (!IsPlausiblePointer(localPlayersData))
+            return false;
+        uint64_t localPlayer = *reinterpret_cast<uint64_t*>(localPlayersData);
+        if (!IsPlausiblePointer(localPlayer))
+            return false;
+        uint64_t playerController = *reinterpret_cast<uint64_t*>(localPlayer + 0x30);
+        if (!IsPlausiblePointer(playerController))
+            return false;
+        uint64_t pawn = *reinterpret_cast<uint64_t*>(playerController + 0x360);
+        return IsPlausiblePointer(pawn);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static std::atomic<bool> g_loggedGObjectsCount{ false };
+
+static bool IsEngineReadyForClassification()
+{
+    TUObjectArray* gObjects = GetGObjects();
+    int32_t count = 0;
+    if (!gObjects || !TryGetGObjectsCount(gObjects, count))
+        return false;
+
+    bool expected = false;
+    if (count > 0 && g_loggedGObjectsCount.compare_exchange_strong(expected, true))
+    {
+        LogLine("IsEngineReadyForClassification: first nonzero GObjects count seen = " +
+                std::to_string(count) + " (threshold is currently 50000)");
+    }
+
+    // 50000: real data showed GObjects reaching ~250000-600000 during
+    // ordinary gameplay - comfortably past this floor, while a genuine
+    // pre-boot splash-screen moment (the original crash this gate was
+    // added for) sits far below it.
+    if (count <= 50000)
+        return false;
+
+    if (!HasLocalPawn())
+        return false;
+
+    if (!HasPersistentLevel())
+        return false;
+
+    return true;
+}
+
+static bool TryGetByIndexSafe(TUObjectArray* arr, int32_t index, void*& outPtr)
+{
+    __try
+    {
+        outPtr = arr->GetByIndex(index);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool TryReadComparisonIndex(void* objPtr, int32_t& outIndex)
+{
+    __try
+    {
+        uintptr_t obj = reinterpret_cast<uintptr_t>(objPtr);
+        outIndex = *reinterpret_cast<int32_t*>(obj + 0x18);
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -522,23 +544,6 @@ static bool TryGetObjectName(void* objPtr, std::string& outName)
     if (!TryReadComparisonIndex(objPtr, comparisonIndex))
         return false;
 
-    // Buffer size: see NAME_RESOLVE_BUFFER_SIZE's own comment - this used
-    // to be a bare `wchar_t buffer[1024]`, which is exactly UE4's own
-    // NAME_SIZE constant (a single FName's plain string can already be
-    // right up against that limit BEFORE any "_N" instance-number suffix
-    // is appended - e.g. "BP_Zombie_C_2384" during a mass-actor-spawn
-    // burst, which is exactly what a zone-transition loading screen is).
-    // AppendString treats {Data,Num,Max} as a real owned TArray<TCHAR> and
-    // will try to GROW it through the engine's own allocator if the
-    // resolved string doesn't fit - on a stack pointer that was never
-    // heap-allocated by that allocator in the first place. That's
-    // undefined behavior (effectively FMemory::Realloc'ing a stack
-    // address) and was the actual cause of a 100%-deterministic crash
-    // (identical PCallStackHash across multiple UE4 crash reports)
-    // reproducing specifically during end-of-mission loading screens -
-    // exactly when actor instance counts, and therefore "_N" suffix
-    // length, spike. Sized generously below so the engine never has a
-    // reason to attempt that grow at all.
     wchar_t buffer[NAME_RESOLVE_BUFFER_SIZE];
     int32_t len = 0;
     if (!TryResolveName(comparisonIndex, buffer, NAME_RESOLVE_BUFFER_SIZE, len))
@@ -569,6 +574,11 @@ static bool TryGetClassName(void* objPtr, std::string& outName)
     return TryGetObjectName(classPtr, outName);
 }
 
+// Forward-declared: defined further below, but HandleResolveName (right
+// here) needs it before that point in the file - same forward-reference
+// situation as GetGObjects() hit earlier in this project's history.
+static void QueueAndWaitForRenderThread(const std::function<void()>& work);
+
 std::string HandleResolveName(const std::string& hexIndex)
 {
     int32_t comparisonIndex = 0;
@@ -581,24 +591,46 @@ std::string HandleResolveName(const std::string& hexIndex)
         return "ERROR:could not parse index";
     }
 
-    // See TryGetObjectName's comment on NAME_RESOLVE_BUFFER_SIZE for why
-    // this isn't just 1024 (UE4's own NAME_SIZE) anymore.
-    wchar_t buffer[NAME_RESOLVE_BUFFER_SIZE];
-    int32_t len = 0;
-    if (!TryResolveName(comparisonIndex, buffer, NAME_RESOLVE_BUFFER_SIZE, len))
-        return "ERROR:AppendString call faulted";
-
-    if (len <= 0)
-        return "ERROR:empty result (invalid index?)";
-
-    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, buffer, len, nullptr, 0, nullptr, nullptr);
-    if (utf8Len <= 0)
-        return "ERROR:UTF8 conversion failed";
-
-    std::string result(utf8Len, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, buffer, len, &result[0], utf8Len, nullptr, nullptr);
-
-    return "NAME:" + result;
+    // MUST run on the game's own thread, same constraint HandleFindByName
+    // already respects for its GObjects walk (see that function and
+    // QueueAndWaitForRenderThread's own comment) - AppendString is the
+    // real engine function TryResolveName calls into, and this handler
+    // used to call it DIRECTLY from PipeServerThread (a thread the
+    // engine never expected to call into its own FName/AppendString
+    // machinery from at all), unlike every other AppendString-calling
+    // path in this file. resolve_fname_via_pipe (dungeons_reader.py)
+    // routes through this handler hundreds of times per session via
+    // resolve_gamebp_class_index alone (15 calls/tick, accumulating into
+    // the hundreds) - repeated off-thread corruption of internal engine
+    // name-resolution state is a strong match for a crash that recurs
+    // with an identical signature regardless of what specifically
+    // triggered it, only after several minutes of accumulated calls.
+    auto result = std::make_shared<std::string>("ERROR:did not run");
+    QueueAndWaitForRenderThread([comparisonIndex, result]()
+    {
+        wchar_t buffer[NAME_RESOLVE_BUFFER_SIZE];
+        int32_t len = 0;
+        if (!TryResolveName(comparisonIndex, buffer, NAME_RESOLVE_BUFFER_SIZE, len))
+        {
+            *result = "ERROR:AppendString call faulted";
+            return;
+        }
+        if (len <= 0)
+        {
+            *result = "ERROR:empty result (invalid index?)";
+            return;
+        }
+        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, buffer, len, nullptr, 0, nullptr, nullptr);
+        if (utf8Len <= 0)
+        {
+            *result = "ERROR:UTF8 conversion failed";
+            return;
+        }
+        std::string utf8(utf8Len, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, buffer, len, &utf8[0], utf8Len, nullptr, nullptr);
+        *result = "NAME:" + utf8;
+    });
+    return *result;
 }
 
 // ---- generic thread-hopped work (for anything besides ProcessEvent that
@@ -662,11 +694,18 @@ std::string HandleFindByName(const std::string& targetName)
 
         std::ostringstream matches;
         int matchCount = 0;
-        int32_t total = gObjects->Num();
+        int32_t total = 0;
+        if (!TryGetGObjectsCount(gObjects, total))
+        {
+            *result = "ERROR:GObjects count read faulted (likely mid zone-transition) - retry later";
+            return;
+        }
 
         for (int32_t i = 0; i < total; ++i)
         {
-            void* objPtr = gObjects->GetByIndex(i);
+            void* objPtr = nullptr;
+            if (!TryGetByIndexSafe(gObjects, i, objPtr))
+                continue;  // this slot's chunk faulted - skip it, don't abort the whole scan
             if (!objPtr)
                 continue;
 
@@ -693,6 +732,67 @@ std::string HandleFindByName(const std::string& targetName)
     return *result;
 }
 
+// Finds every live instance of a given CLASS (by class name, e.g.
+// "UMG_MissionLockedPanel_C") - unlike HandleFindByName above, which
+// matches an individual object's own instance name. Modeled directly on
+// HandleFindByName's structure (same GObjects-walk safety, same render-
+// thread requirement - TryGetClassName below calls TryGetObjectName on
+// the class pointer, which goes through TryResolveName/AppendString, so
+// this has the exact same off-thread-AppendString hazard HandleFindByName
+// and HandleResolveName both already guard against via
+// QueueAndWaitForRenderThread).
+std::string HandleFindByClass(const std::string& targetClassName)
+{
+    auto result = std::make_shared<std::string>("ERROR:did not run");
+
+    QueueAndWaitForRenderThread([targetClassName, result]()
+    {
+        TUObjectArray* gObjects = GetGObjects();
+        if (!gObjects)
+        {
+            *result = "ERROR:could not resolve GObjects";
+            return;
+        }
+
+        std::ostringstream matches;
+        int matchCount = 0;
+        int32_t total = 0;
+        if (!TryGetGObjectsCount(gObjects, total))
+        {
+            *result = "ERROR:GObjects count read faulted (likely mid zone-transition) - retry later";
+            return;
+        }
+
+        for (int32_t i = 0; i < total; ++i)
+        {
+            void* objPtr = nullptr;
+            if (!TryGetByIndexSafe(gObjects, i, objPtr))
+                continue;  // this slot's chunk faulted - skip it, don't abort the whole scan
+            if (!objPtr)
+                continue;
+
+            std::string className;
+            if (!TryGetClassName(objPtr, className))
+                continue;
+
+            if (className == targetClassName)
+            {
+                if (matchCount > 0)
+                    matches << ",";
+                matches << std::hex << reinterpret_cast<uintptr_t>(objPtr);
+                matchCount++;
+            }
+        }
+
+        std::ostringstream out;
+        out << "FOUND:" << matchCount;
+        if (matchCount > 0)
+            out << "|" << matches.str();
+        *result = out.str();
+    });
+
+    return *result;
+}
 std::string FindObjectsWithOuter(uintptr_t targetOuter)
 {
     auto result = std::make_shared<std::string>("ERROR:did not run");
@@ -708,11 +808,18 @@ std::string FindObjectsWithOuter(uintptr_t targetOuter)
 
         std::ostringstream matches;
         int matchCount = 0;
-        int32_t total = gObjects->Num();
+        int32_t total = 0;
+        if (!TryGetGObjectsCount(gObjects, total))
+        {
+            *result = "ERROR:GObjects count read faulted (likely mid zone-transition) - retry later";
+            return;
+        }
 
         for (int32_t i = 0; i < total; ++i)
         {
-            void* objPtr = gObjects->GetByIndex(i);
+            void* objPtr = nullptr;
+            if (!TryGetByIndexSafe(gObjects, i, objPtr))
+                continue;  // this slot's chunk faulted - skip it, don't abort the whole scan
             if (!objPtr)
                 continue;
 
@@ -1030,8 +1137,26 @@ static std::mutex g_chestReportClassifyMutex;
 static std::unordered_set<void*> g_chestReportFunctionPtrs;
 static std::unordered_set<void*> g_nonChestReportFunctionPtrs;
 
+// Toggled from Python via the pipe ("set_chest_reporting:0"/"1") whenever
+// the tracked zone changes - the hub has no random loot chests (only
+// merchant/storage chests, already handled by the broader Interact-
+// family path, not this narrow one), so there's nothing for this
+// classifier to usefully find there. Skipping it entirely while in the
+// hub means one less classification pass running (including its
+// TryGetObjectName name-resolution read, the actual expensive part) on
+// every newly-seen UFunction pointer during zone-load/transition windows
+// - exactly the moments a real, still only partially-understood crash
+// keeps happening around (see LoadGameWorld/AGameBP loading-function
+// discussion). Not a confirmed fix for that crash by itself, but a
+// reasonable, low-risk way to shrink the hook's footprint during it.
+// Defaults to enabled so behavior is unchanged unless Python opts in.
+static std::atomic<bool> g_chestReportingEnabled{true};
+
 static bool IsChestReportFunction(void* function)
 {
+    if (!g_chestReportingEnabled.load(std::memory_order_relaxed))
+        return false;
+
     {
         std::lock_guard<std::mutex> lock(g_chestReportClassifyMutex);
         if (g_chestReportFunctionPtrs.count(function))
@@ -1511,147 +1636,48 @@ static void CaptureMissionOutcomeEvent(void* self, const std::string& triggerNam
     g_missionOutcomeEvents.push_back({ reinterpret_cast<uint64_t>(self), triggerName });
 }
 
-// Isolated POD-only helper - no C++ objects with destructors in scope, same
-// MSVC /EHsc restriction (C2712) as TryReadClassPtr/TryProcessEventCall
-// above: __try cannot appear in a function that also needs C++ object
-// unwinding, which hkProcessEvent very much does (std::string, lock_guard,
-// etc. throughout). See IsEngineReadyForClassification's call site for why
-// this check exists at all.
-static std::atomic<bool> g_loggedGObjectsCount{ false };
-
-// Pure POD read, no std:: types in scope - safe to wrap in __try. Returns
-// -1 on any fault or missing GObjects, otherwise the live count.
-static int32_t TryReadGObjectsCount()
+// hkProcessEvent itself is now a thin __try/__except wrapper (below) -
+// all the actual classification/detection logic that used to live directly
+// in hkProcessEvent was moved, unchanged, into this _Impl function. This is
+// purely a crash-containment measure: MSVC's __try/__except can't wrap a
+// scope that also does C++ object unwinding/destructors directly (same
+// restriction noted elsewhere in this file, e.g. around TryProcessEventCall),
+// so the real logic needed to move into its own function callable from
+// inside a plain __try block, rather than annotating hkProcessEvent in place.
+// blockedOut is an out-param since __except's filter can't see local
+// variables declared inside the __try'd call in the caller's scope.
+void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blockedOut)
 {
-    __try
-    {
-        TUObjectArray* gObjects = GetGObjects();
-        if (!gObjects)
-            return -1;
-        return gObjects->Num();
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return -1;
-    }
-}
+    // Services queued CALL/CALLDATA requests (see HandleCall/HandleCallData)
+    // here instead of from a Present hook. Present hooking required creating
+    // a second, throwaway D3D11 device via D3D11CreateDeviceAndSwapChain at
+    // startup just to read Present's address off its vtable - concurrent
+    // with the game's own real device/swapchain creation. That's the
+    // strongest suspect for a crash seen consistently at game startup
+    // ("during connection, on construction", 3 identical crash dumps, zero
+    // dungeons_bridge frames on any of them - consistent with a GPU-driver-
+    // level fault, not our own code). ProcessEvent is already confirmed
+    // firing reliably and immediately once the game is running, whether or
+    // not a real Present address was ever found, so it's a strictly safer
+    // place to drain from - see SetupHookThread's own comment for why the
+    // Present hook attempt itself was removed entirely, not just made
+    // optional.
+    DrainPendingCalls();
+    DrainGenericWork();
 
-static bool IsEngineReadyForClassification()
-{
-    int32_t count = TryReadGObjectsCount();
-    if (count < 0)
-        return false;
-
-    // One-shot diagnostic: confirmed live at 287638 during real gameplay
-    // (see the threshold comment below for what this changed to).
-    bool expected = false;
-    if (count > 0 && g_loggedGObjectsCount.compare_exchange_strong(expected, true))
-    {
-        LogLine("IsEngineReadyForClassification: first nonzero GObjects count seen = " +
-                std::to_string(count) + " (threshold is currently 50000)");
-    }
-
-    // Raised from 1000 (itself already lowered from an original guess of
-    // 10000) now that real data is in: a live session showed GObjects at
-    // 287638 during ordinary gameplay - nearly 300x the old 1000
-    // threshold, meaning that floor had almost no real margin against
-    // whatever the true pre-boot/splash-screen count actually is. 50000
-    // keeps a healthy ~5.7x safety margin below the observed real count
-    // while still being comfortably higher than anything a genuine
-    // pre-boot splash-screen moment (the crash this gate exists for)
-    // would show.
-    if (count <= 50000)
-        return false;
-
-    // GObjects count alone only ever drops back to a small number ONCE,
-    // right at boot - it does NOT dip again on every later level
-    // transition (individual actors get destroyed/recreated, but the
-    // total object count stays high for the rest of the session), so
-    // this check by itself can't catch anything past the very first
-    // load. GWorld, on the other hand, DOES go through an unstable
-    // window on every zone transition, not just boot - confirmed live
-    // via /find_gamebp: GWorld read back as -1 (not a real pointer)
-    // while genuinely mid-transition between missions. Classification
-    // walks class/object names off of `self` pointers that are
-    // meaningless to trust if the world itself isn't in a stable state
-    // yet, so this reuses that same signal as a second, ongoing gate -
-    // covering every zone transition for the rest of the session, not
-    // just the one-time boot window the GObjects count check covers.
-    if (!IsPlausiblePointer(GetCurrentWorldPtr()))
-        return false;
-
-    // Third gate, added for the menu/character-select crash specifically:
-    // a full main menu / character-select screen already has plenty of
-    // its own UI UObjects loaded (comfortably past the 50000-count floor
-    // above) and its own perfectly valid (if not gameplay-relevant)
-    // UWorld, so neither check above actually catches this window - both
-    // pass happily while the player hasn't even picked a character yet.
-    // Mirrors the same precondition give_item.py's own safety stack
-    // already gates real item grants on ("No Pawn - character not
-    // spawned yet?") - if there's no live Pawn, there's no real gameplay
-    // actor state worth classifying yet either, so skip the same way.
-    if (!HasLocalPawn())
-        return false;
-
-    // Fourth gate, added for a crash occurring EARLIER than any of the
-    // above - confirmed at SecondsSinceStart=0, before the main menu.
-    // GObjects/GWorld/Pawn can apparently all appear individually
-    // plausible during this window without genuinely representing a
-    // playable world - see HasPersistentLevel's own comment for the
-    // full reasoning. A real UWorld always has a PersistentLevel; an
-    // early boot-time placeholder is a much safer bet not to.
-    if (!HasPersistentLevel())
-        return false;
-
-    return true;
-}
-
-void hkProcessEvent(void* self, void* function, void* params)
-{
-    // ISOLATION TEST ROUND 3 - stripped even further than Round 1
-    // (which still did an atomic fetch_add and a conditional LogLine
-    // call before passing through, and STILL crashed with the same
-    // hash). This is now the absolute minimum possible detour body:
-    // nothing but an immediate passthrough, to determine whether even
-    // that small amount of bookkeeping was somehow implicated, or
-    // whether the mere existence of ANY redirect through this specific
-    // function's MinHook trampoline is enough on its own. If this
-    // STILL crashes with the identical hash, the problem is not
-    // anything in this file at all - it's in the trampoline/relocation
-    // for this exact function's prologue bytes (a MinHook-level
-    // concern, not fixable here without disassembling the real
-    // binary), or possibly unrelated to hooking altogether.
-    oProcessEvent(self, function, params);
-    return;
-
-#if 0
     uint64_t callNum = g_processEventCallCount.fetch_add(1, std::memory_order_relaxed);
     if (callNum == 0)
         LogLine("hkProcessEvent: first call received - hook is definitely firing.");
-#endif
 
     // Engine-readiness gate: every classification path below eventually
     // resolves an FName via AppendString, which walks internal engine
-    // name-table/GObjects state. During the earliest moments of process
-    // startup (confirmed: crashes 100% of the time exactly at the Xbox/
-    // publisher splash logo, which renders before the main game module
-    // has finished its own startup sequence) that state isn't safely
-    // queryable yet, regardless of buffer size - this is a DIFFERENT
-    // failure mode than the NAME_RESOLVE_BUFFER_SIZE overflow fixed
-    // earlier, not a recurrence of it (crash location moved from
-    // end-of-mission to the very first splash frame, which wouldn't
-    // happen if it were the same bug). GObjects's own element count is a
-    // simple, offset-only readiness proxy: a UE4 process this early into
-    // boot has nowhere near a real game's worth of live UObjects yet, so
-    // gating classification (not the passthrough call itself) behind a
-    // sane minimum count avoids touching name resolution during that
-    // fragile window without needing to know the exact internal reason
-    // it's unsafe. Passthrough (oProcessEvent) always still runs either
-    // way - gameplay is never blocked, only OUR bookkeeping is skipped
-    // until the engine is far enough into boot to trust.
+    // name-table/GObjects state - unsafe during early boot/menu windows
+    // even though DrainPendingCalls/DrainGenericWork above (a deliberate,
+    // user-triggered CALL/CALLDATA request) already ran regardless, since
+    // those don't depend on this classification machinery at all.
     if (!IsEngineReadyForClassification())
     {
-        oProcessEvent(self, function, params);
+        *blockedOut = false;
         return;
     }
 
@@ -1663,24 +1689,19 @@ void hkProcessEvent(void* self, void* function, void* params)
     // through too late to matter. See IsInteractFamilyFunction's comment.
     //
     // EXCLUDING "Highlight" events specifically (OnHighlightBegin/End) -
-    // confirmed live via a crash ~200s into an otherwise-normal session,
-    // landing deep in unrelated legitimate game code (PCallStackHash
-    // matching the same "corrupted-hot-path" signature originally seen
-    // with the since-removed currency hook). IsInteractFamilyFunction's
-    // "Interact" substring match is on the COMPONENT name prefix in the
-    // auto-generated delegate binding (e.g. "BndEvt__InteractableComp
-    // onent_..._OnHighlightBegin__DelegateSignature" matches on
-    // "Interact**able**Component", not on the actual event), so it nets
-    // highlight/hover callbacks that fire constantly just from a player
-    // walking near or looking at a blocked-tier item - far more often
-    // than real pickup attempts - and have nothing to do with picking
-    // anything up. Skipping oProcessEvent for those means silently
-    // dropping a call the engine's own highlight bookkeeping (a paired
-    // begin/end ref-count or similar) likely expects to always complete;
-    // doing that hundreds of times over a real session is a plausible
+    // IsInteractFamilyFunction's "Interact" substring match is on the
+    // COMPONENT name prefix in the auto-generated delegate binding (e.g.
+    // "BndEvt__InteractableComponent_..._OnHighlightBegin__DelegateSignature"
+    // matches on "Interact**able**Component", not on the actual event),
+    // so it nets highlight/hover callbacks that fire constantly just from
+    // a player walking near or looking at a blocked-tier item - far more
+    // often than real pickup attempts - and have nothing to do with
+    // picking anything up. Skipping oProcessEvent for those means
+    // silently dropping a call the engine's own highlight bookkeeping
+    // (a paired begin/end ref-count or similar) likely expects to always
+    // complete; doing that repeatedly over a real session is a plausible
     // way to progressively corrupt engine-internal state without an
-    // immediate, deterministic crash - matching exactly what was
-    // observed (works fine at first, crashes minutes in, not instantly).
+    // immediate, deterministic crash.
     if (IsInteractFamilyFunction(function))
     {
         std::string funcName;
@@ -1703,11 +1724,11 @@ void hkProcessEvent(void* self, void* function, void* params)
         }
     }
 
-    // Per-actor dedupe for Supply Station reporting - see the comment at the
-    // call site below for why this exists even though supply uses the same
-    // trigger filter as regular chests.
-    static std::mutex g_reportedSupplyActorsMutex;
-    static std::unordered_set<uint64_t> g_reportedSupplyActors;
+    // Per-actor dedupe for the broad-match fallback below - see the
+    // comment at the call site for why this exists even though the
+    // narrow "OnInteract" match doesn't need it.
+    static std::mutex g_reportedFallbackActorsMutex;
+    static std::unordered_set<uint64_t> g_reportedFallbackActors;
 
     // Chest-open event reporting: both regular chests AND Supply Stations
     // use IsChestReportFunction - "OnInteract" present, "OnInteracted"
@@ -1715,45 +1736,43 @@ void hkProcessEvent(void* self, void* function, void* params)
     // OnInteracted fires once per spawned item, which would over-count if
     // used for reporting.
     //
-    // g_reportedSupplyActors (dedup by actor address) is a defensive
-    // safety net for Supply specifically - a Supply Station is destroyed
-    // on open rather than flipping a bOpened-style flag the way
-    // AChestActor gives regular chests, so there's no other state
-    // available to double-check against if OnInteract were ever to fire
-    // more than once for the same station. Regular chests don't need it.
-    // Clicky/ClickyComponent-family bound events (confirmed via
-    // dungeons_bridge_debug.log to be what Supply Station's interact
-    // button routes through - see the log's "Classified new Interact-
-    // family function" lines, which only ever show Clicky/ClickyComponent
-    // as broad Interact-family, never as the narrow chest-reporting
-    // match) apparently never produce a bare "OnInteract" ProcessEvent
-    // call the way InteractableComp/ReplicatedInteractable do - only
-    // "OnInteracted" ever fires for them. IsChestReportFunction's narrow
-    // match can therefore never see them at all, meaning a Supply
-    // Station's open was never reaching CaptureInteractEvent - not
-    // misclassified, just structurally unreachable via that path. Falling
-    // back to the broader Interact-family match for this, but ONLY when
-    // the actor's own class name contains "supply" (never for arbitrary
-    // Interact-family hits - that would badly over-report on doors, NPCs,
-    // popups, etc., all of which are also Interact-family), and ONLY when
-    // the narrow match didn't already claim it. The existing per-actor
-    // dedup (originally added as a defensive safety net) is what makes
-    // this safe to widen: OnInteracted can fire more than once per open,
-    // but each actor address can only ever report once.
+    // FALLBACK, generalized beyond Supply: a Supply Station's interact
+    // button was confirmed (via dungeons_bridge_debug.log - only ever
+    // shows Clicky/ClickyComponent as broad Interact-family, never as the
+    // narrow chest-reporting match) to never fire a bare "OnInteract"
+    // ProcessEvent call at all for that component type - only
+    // "OnInteracted" ever fires, so IsChestReportFunction's narrow match
+    // can never see it; not misclassified, just structurally unreachable
+    // via that path. This was originally fixed ONLY for actors whose
+    // class name contains "supply" - but the same structural gap can
+    // apply to a REGULAR CHEST variant just as easily (a different
+    // interactable-component implementation with the same "only
+    // OnInteracted ever fires" behavior - e.g. a newer/DLC chest
+    // Blueprint), and a class name containing "supply" is the only thing
+    // that let it through before, silently excluding any such chest
+    // variant from ever being reported at all. Generalized to also cover
+    // "chest" in the class name, with the exact same per-actor dedup
+    // protection (OnInteracted can fire more than once per open, but
+    // each actor address can only ever report once here) - never widened
+    // to ANY Interact-family hit regardless of class name, which would
+    // badly over-report on doors, NPCs, popups, etc.
     bool isNarrowChestReport = IsChestReportFunction(function);
-    bool isSupplyFallback = !isNarrowChestReport && IsInteractFamilyFunction(function);
-    if (!blocked && (isNarrowChestReport || isSupplyFallback))
+    bool isBroadFallback = !isNarrowChestReport && IsInteractFamilyFunction(function);
+    if (!blocked && (isNarrowChestReport || isBroadFallback))
     {
         std::string className;
         if (TryGetClassName(self, className))
         {
-            if (ToLowerCopy(className).find("supply") != std::string::npos)
+            std::string lowerClassName = ToLowerCopy(className);
+            bool looksLikeChestOrSupply = lowerClassName.find("supply") != std::string::npos ||
+                                           lowerClassName.find("chest") != std::string::npos;
+            if (isBroadFallback && looksLikeChestOrSupply)
             {
                 uint64_t addr = reinterpret_cast<uint64_t>(self);
                 bool alreadyReported;
                 {
-                    std::lock_guard<std::mutex> lock(g_reportedSupplyActorsMutex);
-                    alreadyReported = !g_reportedSupplyActors.insert(addr).second;
+                    std::lock_guard<std::mutex> lock(g_reportedFallbackActorsMutex);
+                    alreadyReported = !g_reportedFallbackActors.insert(addr).second;
                 }
                 if (!alreadyReported)
                     CaptureInteractEvent(addr, className);
@@ -1796,289 +1815,100 @@ void hkProcessEvent(void* self, void* function, void* params)
     }
 
     if (!blocked)
-        oProcessEvent(self, function, params);
-    // else: deliberately NOT calling the original - this is what actually
-    // prevents the pickup. The interaction visually/functionally just does
-    // nothing (no inventory add, no destroy, no sound - whatever the
-    // Blueprint graph would have done never runs).
+        *blockedOut = false;
+    else
+        *blockedOut = true;
+    // Deliberately does NOT call oProcessEvent itself - see hkProcessEvent
+    // below, which calls it exactly once, unconditionally, OUTSIDE this
+    // function's __try wrapper. Keeping the real engine call out of the
+    // SEH-guarded region is intentional: if an exception is ever caught
+    // below, we must be certain oProcessEvent hasn't already run (and so
+    // is still safe/necessary to call) rather than risk calling the
+    // original engine function twice for the same event.
 }
 
-// ------------------------------------------------------------
-// Targeted ExecFunction hooking - replaces the global ProcessEvent hook
-// (hkProcessEvent above, still defined but no longer installed - see
-// SetupHookThread) entirely. The ProcessEvent hook install itself is
-// confirmed to be the crash source: ISOLATION TEST ROUND 3's comment
-// above documents hkProcessEvent stripped to a bare passthrough body
-// STILL crashing with the identical PCallStackHash, which ruled out
-// everything the hook body does, leaving only the hook's INSTALL POINT
-// (the single, always-firing, engine-wide ProcessEvent address) itself
-// implicated.
-//
-// Of everything hkProcessEvent used to do, only ONE piece structurally
-// requires a hook at all: progressive PICKUP-TIER BLOCKING. Blocking is
-// enforcement (preventing a function from running) - there's no memory-
-// poll equivalent for "prevent this from happening." Everything else
-// hkProcessEvent used to capture is dead code now with nothing on the
-// Python side consuming it: chest/supply reporting -> poll_chest_events,
-// boss kills -> poll_boss_kill_events, mission outcome -> the
-// MISSION_END_WIDGET_CLASS scan / call_is_mission_completed, currency ->
-// UWalletComponent polling (g_currencyPtr has been permanently null since
-// before this change, per the comment below), and secret-found was never
-// consumed by anything on the Python side even before today.
-//
-// Instead of hooking ProcessEvent itself, this hooks UFunction::
-// ExecFunction (offset 0xC0, confirmed via the Dumper-7 SDK dump:
-// `FNativeFuncPtr ExecFunction` on UFunction, signature
-// void(Context, TheStack, Result)) INDIVIDUALLY, only for the specific
-// Interact-family UFunction objects that actually exist (found via a
-// GObjects sweep using the exact same IsInteractFamilyFunction name-
-// matching already proven correct above - no new classification logic,
-// just a different install point). Every other UFunction in the game -
-// the overwhelming majority of all ProcessEvent traffic - is never
-// touched, so whatever the ProcessEvent hook's crash actually was, it
-// has no opportunity to reproduce here unless it turns out to be
-// inherent to MinHook detouring on this binary/build in general -
-// which this test will also reveal.
-//
-// A Blueprint's auto-generated bound-event UFunction (e.g.
-// "BndEvt__InteractableComponent0_OnInteracted__DelegateSignature")
-// lives on that Blueprint's UClass, shared by every instance of that
-// class - hooking it ONCE covers every pickup of that type in the
-// world. Context (arg0 of ExecFunction) is still the specific
-// interacting actor instance at call time, so ClassifyPickupTier still
-// gets the real per-instance class name - identical decision logic to
-// before, just triggered from a narrower set of hook points.
-//
-// KNOWN GAP: a Blueprint class that doesn't exist in GObjects yet at
-// sweep time (its zone hasn't streamed in) won't be hooked until the
-// NEXT sweep - see ExecSweepThread below, which re-sweeps periodically
-// rather than once, specifically to catch these as they load in. This
-// is a real window (up to one sweep interval) where a not-yet-loaded
-// pickup type could be collected above its unlocked tier - accepted as
-// a much smaller problem than a crashing hook.
+// Theoretical/preventive hardening, added after a beta tester's crash dump
+// showed the fault happening directly inside this DLL's own frames (not the
+// game's) - most likely our classification code (TryGetClassName, the various
+// IsXFunction matchers, resolve_fname-style GObjects/FName walks) touching an
+// object that's still mid-construction, whose vtable/class pointer isn't
+// valid yet. Not confirmed against a repro - we don't have the exact source
+// that produced the crashing .dll, so this can't be verified against that
+// specific build. What this DOES guarantee: an access violation raised
+// anywhere inside classification/detection no longer takes the whole game
+// down - it's caught, logged once, and oProcessEvent (the actual engine
+// call the player's action depends on) still runs exactly once regardless,
+// unmodified, exactly as if detection had been skipped entirely for that call.
+static std::atomic<uint64_t> g_hkProcessEventExceptionCount{0};
 
-static constexpr size_t MAX_EXEC_HOOKS = 512;  // generous headroom over the actual distinct Interact-family UFunction count expected in a real session (see "Classified new Interact-family function" in dungeons_bridge_debug.log for the real number once tested)
-
-typedef void(*ExecFunctionPtr)(void*, void*, void*);
-
-static std::atomic<ExecFunctionPtr> g_execOriginal[MAX_EXEC_HOOKS] = {};
-static std::mutex g_execHookedMutex;
-static std::unordered_set<void*> g_execHookedFunctions;  // UFunction* already hooked - dedupe across sweeps
-static std::atomic<size_t> g_execHookCount{ 0 };
-
-// Shared body every generated stub slot (below) calls into, with its own
-// slot index baked in at compile time via the template - this is what
-// lets MAX_EXEC_HOOKS independently-addressed MinHook detours all reuse
-// one implementation instead of MAX_EXEC_HOOKS hand-written copies.
-// Same blocking decision as the old hkProcessEvent's blocking branch,
-// just reading Context directly instead of ProcessEvent's `self` arg.
-static void ExecFunctionBlockCommon(size_t slot, void* Context, void* TheStack, void* Result)
+// Pulled out of hkProcessEvent on purpose: it builds std::string temporaries
+// (std::to_string, concatenation), and a function containing a __try/__except
+// can't also contain any C++ object requiring destructor/unwind handling
+// under /EHsc (MSVC C2712) - including temporaries created inside the
+// __except block itself, not just named locals. Keeping hkProcessEvent's own
+// body free of any such object is what lets it use __try at all.
+void LogProcessEventException()
 {
-    ExecFunctionPtr original = g_execOriginal[slot].load(std::memory_order_relaxed);
+    uint64_t n = g_hkProcessEventExceptionCount.fetch_add(1, std::memory_order_relaxed);
+    if (n < 20)  // cap - a fast, repeating crash-and-catch loop shouldn't spam the log file unbounded
+        LogLine("hkProcessEvent: caught an exception in classification/detection code "
+                 "(#" + std::to_string(n + 1) + ") - object was likely mid-construction. "
+                 "Treating this call as not-blocked and calling the original function unmodified.");
+}
 
+void hkProcessEvent(void* self, void* function, void* params)
+{
     bool blocked = false;
-    if (Context)
+    __try
     {
-        std::string className;
-        if (TryGetClassName(Context, className))
+        hkProcessEvent_Impl(self, function, params, &blocked);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        LogProcessEventException();
+        blocked = false;  // classification never completed, so there's nothing
+                           // to justify blocking this call - fail open, not closed.
+    }
+    // Called exactly once, always, regardless of whether classification
+    // above succeeded or was caught - see the comment on hkProcessEvent_Impl
+    // for why the real engine call had to move out here.
+    if (!blocked)
+    {
+        oProcessEvent(self, function, params);
+        return;
+    }
+
+    // Skipping the real call above leaves `params` untouched - for a
+    // UFunction with a return value, that's whatever garbage the caller's
+    // stack/buffer already had there, not the zero/false a "this call was
+    // blocked" outcome should read as. If the calling Blueprint branches on
+    // or dereferences that return value, it's reading garbage - this is
+    // the exact same root cause already found and fixed in the newer
+    // per-function ExecFunction-hook version of this project (see
+    // ExecFunctionBlockCommon's g_execReturnSize there): a real UE4Minidump
+    // crash traced back to a blocked native call whose Result slot was
+    // never initialized. Same fix, applied here: zero the return-value
+    // portion of `params` using UFunction::ParmsSize (+0x9E) and
+    // UFunction::ReturnValueOffset (+0xA0) - standard UE4.22 layout,
+    // confirmed via Dumper-7's Pad_9C[0x24] between FunctionFlags (0x98)
+    // and ExecFunction (0xC0) lining up exactly with this field layout.
+    __try
+    {
+        uint16_t parmsSize = *reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(function) + 0x9E);
+        uint16_t returnValueOffset = *reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(function) + 0xA0);
+        if (returnValueOffset != 0xFFFF && parmsSize > returnValueOffset)
         {
-            int tier = ClassifyPickupTier(className);
-            int unlocked = g_pickupUnlockTier.load(std::memory_order_relaxed);
-            if (tier > 0 && tier > unlocked)
-            {
-                blocked = true;
-                LogLine("BLOCKED pickup (tier " + std::to_string(tier) + " > unlocked " +
-                         std::to_string(unlocked) + "): " + className);
-            }
+            uint16_t returnSize = parmsSize - returnValueOffset;
+            memset(reinterpret_cast<uint8_t*>(params) + returnValueOffset, 0, returnSize);
         }
     }
-
-    if (!blocked && original)
-        original(Context, TheStack, Result);
-    // else: deliberately not calling through - this is what prevents the
-    // pickup, same mechanism as before, just scoped to this one specific
-    // UFunction's ExecFunction instead of decided inline in a shared
-    // ProcessEvent handler.
-}
-
-template<size_t Slot>
-static void ExecFunctionBlockStub(void* Context, void* TheStack, void* Result)
-{
-    ExecFunctionBlockCommon(Slot, Context, TheStack, Result);
-}
-
-template<size_t... Is>
-static constexpr std::array<ExecFunctionPtr, sizeof...(Is)> MakeExecStubTable(std::index_sequence<Is...>)
-{
-    return { &ExecFunctionBlockStub<Is>... };
-}
-
-static const std::array<ExecFunctionPtr, MAX_EXEC_HOOKS> g_execStubTable =
-    MakeExecStubTable(std::make_index_sequence<MAX_EXEC_HOOKS>{});
-
-// Hooks one UFunction's ExecFunction pointer, if there's a free slot and
-// it isn't already hooked. Safe to call repeatedly on the same function -
-// the g_execHookedFunctions dedupe makes re-sweeping idempotent.
-static void TryHookInteractFunction(void* function)
-{
+    __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        std::lock_guard<std::mutex> lock(g_execHookedMutex);
-        if (g_execHookedFunctions.count(function))
-            return;
-    }
-
-    // Same Highlight-event exclusion as the old hkProcessEvent's blocking
-    // branch (see its comment above, unchanged: hooking these caused the
-    // slow-corruption crash from a since-removed engine-side ref-count
-    // expectation) - never hook these, not even for observation.
-    std::string funcName;
-    if (TryGetObjectName(function, funcName) && funcName.find("Highlight") != std::string::npos)
-        return;
-
-    // CRITICAL FILTER - added after a real session's debug log showed
-    // MH_CreateHook failing with MH_ERROR_ALREADY_CREATED (status 3) on
-    // the SAME handful of function names dozens of times each (e.g.
-    // "BndEvt__ReplicatedInteractable_K2Node_ComponentBoundEvent_0_
-    // OnInteract__DelegateSignature" alone failed 72 times). Root cause:
-    // pure Blueprint-graph functions (no native C++ implementation) do
-    // NOT get their own compiled ExecFunction thunk - they all share the
-    // SAME generic Blueprint-VM interpreter entry point. The first one
-    // hooked successfully then intercepts EVERY Blueprint function call
-    // in the entire game that routes through that shared interpreter,
-    // not just Interact-family ones - this is what caused the freezes
-    // and the crash during level-load transitions (massive overhead +
-    // wrong-context blocking checks on unrelated Blueprint calls).
-    //
-    // Fix: only hook UFunctions with the Native flag set (EFunctionFlags
-    // ::Native = 0x400, confirmed via the Dumper-7 dump's Basic.hpp;
-    // FunctionFlags itself confirmed at UFunction+0x98). Only native
-    // functions get a unique, individually-compiled thunk safe to hook
-    // this way.
-    //
-    // KNOWN CONSEQUENCE: the actual pickup/chest OnInteracted bound-event
-    // functions are themselves pure Blueprint graphs (that's exactly what
-    // was colliding above) - this filter means NONE of them get hooked
-    // anymore, so progressive pickup-tier blocking goes back to not
-    // functioning, in exchange for the game no longer freezing/crashing.
-    // This is a real regression, not a side effect to ignore - it needs
-    // a genuinely different mechanism (e.g. one single hook on the
-    // shared interpreter address itself, filtering by reading FFrame::
-    // Node inside it to identify which specific function is executing
-    // before deciding whether to block - NOT implemented here, since
-    // FFrame's layout isn't in this SDK dump and needs its own
-    // confirmed offset before it's safe to try) rather than resurrecting
-    // this per-function approach for Blueprint-graph functions.
-    uint32_t functionFlags = 0;
-    if (!TryReadFunctionFlags(function, functionFlags))
-        return;
-    constexpr uint32_t FUNC_Native = 0x00000400;
-    if (!(functionFlags & FUNC_Native))
-        return;  // pure Blueprint graph - shares the generic VM thunk, not safe to hook individually
-
-    // Mark as attempted BEFORE the actual hook attempt, covering every
-    // return path below (success or failure) - not just success like
-    // before. The old version only added to g_execHookedFunctions on
-    // success, so a failed attempt (e.g. MH_CreateHook returning
-    // ALREADY_CREATED for a genuine collision) got retried on every
-    // single 10s re-sweep forever, spamming the log with the same
-    // failure hundreds of times over a session (confirmed: 244
-    // "exhausted"/failure log lines in one real session alone).
-    {
-        std::lock_guard<std::mutex> lock(g_execHookedMutex);
-        g_execHookedFunctions.insert(function);
-    }
-
-    size_t slot = g_execHookCount.fetch_add(1, std::memory_order_relaxed);
-    if (slot >= MAX_EXEC_HOOKS)
-    {
-        LogLine("TryHookInteractFunction: MAX_EXEC_HOOKS exhausted, not hooking: " + funcName);
-        g_execHookCount.fetch_sub(1, std::memory_order_relaxed);
-        return;
-    }
-
-    void* execFuncAddr = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(function) + 0xC0);
-    if (!execFuncAddr)
-    {
-        g_execHookCount.fetch_sub(1, std::memory_order_relaxed);  // slot never used - give it back
-        return;  // no native thunk assigned - nothing to hook
-    }
-
-    void* original = nullptr;
-    MH_STATUS createStatus = MH_CreateHook(execFuncAddr, reinterpret_cast<void*>(g_execStubTable[slot]), &original);
-    if (createStatus != MH_OK)
-    {
-        LogLine("TryHookInteractFunction: MH_CreateHook failed (" + std::to_string(static_cast<int>(createStatus)) +
-                ") for " + funcName);
-        g_execHookCount.fetch_sub(1, std::memory_order_relaxed);  // slot never used - give it back
-        return;
-    }
-    MH_STATUS enableStatus = MH_EnableHook(execFuncAddr);
-    if (enableStatus != MH_OK)
-    {
-        LogLine("TryHookInteractFunction: MH_EnableHook failed (" + std::to_string(static_cast<int>(enableStatus)) +
-                ") for " + funcName);
-        // NOT giving the slot back here - MH_CreateHook DID succeed, so a
-        // real trampoline now exists at g_execStubTable[slot]'s target
-        // even though enabling failed; reusing this slot for a different
-        // function would be unsafe. Rare path, acceptable one-slot loss.
-        return;
-    }
-
-    g_execOriginal[slot].store(reinterpret_cast<ExecFunctionPtr>(original), std::memory_order_relaxed);
-    LogLine("Hooked Interact-family ExecFunction (slot " + std::to_string(slot) + "): " + funcName);
-}
-
-// One full GObjects walk, hooking every not-yet-hooked Interact-family
-// UFunction found. Called once from SetupHookThread, then re-run
-// periodically by ExecSweepThread below to catch classes that stream in
-// later (see the KNOWN GAP note in the module comment above).
-static void SweepAndHookInteractFunctions()
-{
-    TUObjectArray* gObjects = GetGObjects();
-    if (!gObjects)
-    {
-        LogLine("SweepAndHookInteractFunctions: could not resolve GObjects.");
-        return;
-    }
-
-    int32_t count = gObjects->Num();
-    for (int32_t i = 0; i < count; ++i)
-    {
-        void* obj = gObjects->GetByIndex(i);
-        if (!obj)
-            continue;
-
-        std::string className;
-        if (!TryGetClassName(obj, className) || className != "Function")
-            continue;  // only interested in UFunction objects themselves
-
-        if (IsInteractFamilyFunction(obj))
-            TryHookInteractFunction(obj);
+        // function/params pointers turned out not to be safely readable
+        // here - nothing more we can do; the block itself still holds.
     }
 }
 
-static void ExecSweepThread()
-{
-    // Give the engine time to boot past the same fragile early-startup
-    // window IsEngineReadyForClassification already exists to guard
-    // against (GObjects/name-table not safely queryable yet) - reusing
-    // that exact readiness check rather than a fixed sleep, since it's
-    // already the proven-correct signal for "safe to walk GObjects and
-    // resolve FNames now."
-    while (!IsEngineReadyForClassification())
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-    for (;;)
-    {
-        SweepAndHookInteractFunctions();
-        // Re-sweep every 10s rather than once - new Blueprint classes
-        // (previously-unseen pickup types) can load in as new zones
-        // stream in mid-session; each already-hooked function is
-        // skipped instantly via g_execHookedFunctions, so a redundant
-        // sweep is cheap.
-        std::this_thread::sleep_for(std::chrono::seconds(10));
-    }
-}
 
 // ---- Currency pointer capture, via the exact technique confirmed working
 // in a real Cheat Engine table (Dungeons_Master_Table_v3_70.CT) ----
@@ -2103,13 +1933,41 @@ static void ExecSweepThread()
 // returns int in EAX, a normal C function with this signature is ABI-
 // compatible as a drop-in replacement - no hand-assembled bytes needed.
 
-// The currency hook (hkCurrencyGetter) that used to populate this has been
-// removed entirely - see the removal note above the old install site
-// further down. g_currencyPtr now stays permanently null; the
-// "get_currency_ptr" pipe command still exists and just reports that,
-// harmlessly, since nothing on the Python side has sent that request
-// since the emerald system moved to UWalletComponent::ClientAdd/Balance.
 static void* g_currencyPtr = nullptr;
+
+typedef int(*CurrencyGetterFn)(void* thisPtr);
+static CurrencyGetterFn oCurrencyGetter = nullptr;
+
+int hkCurrencyGetter(void* thisPtr)
+{
+    // Always track the LATEST thisPtr the game itself calls this getter
+    // with - NOT just the first one ever seen. This getter is called
+    // constantly by the game's own UI/logic, always with whatever the
+    // CURRENT live currency object is. A "capture once, keep forever"
+    // guard (the previous `if (!g_currencyPtr)` here) means that if the
+    // underlying currency component is ever destroyed and recreated -
+    // a hero swap, a save reload, the same class of zone-transition
+    // churn already documented around apply_emerald_reward's own
+    // staleness handling on the Python side - g_currencyPtr stays
+    // permanently pinned to the OLD, now-stale/freed pointer, and every
+    // later call (which DOES have the correct new pointer) gets
+    // silently ignored. Confirmed happening live: a long-running
+    // Dungeons.exe process (same PID across multiple client sessions)
+    // ended up handing back a wildly garbage read (-1558079228) through
+    // the stale pointer, and every subsequent write via that same
+    // pointer "verified" successfully against ITSELF (read-back matched
+    // what was just written) while never touching the real, live
+    // currency object at all - so the in-game HUD never moved despite
+    // every grant reporting success. Unconditionally re-assigning here
+    // keeps g_currencyPtr self-healing: it converges back onto the real
+    // live object within one native getter call after the game itself
+    // next needs to display/use the currency (essentially immediately -
+    // this getter is called far more often than dungeons_reader.py
+    // polls), rather than requiring the whole DLL (and therefore the
+    // whole game process) to restart to recover.
+    g_currencyPtr = thisPtr;
+    return oCurrencyGetter(thisPtr);
+}
 
 // Simple AOB scan across the main module's mapped image (reads size from
 // its own PE header - no extra library dependency needed). Returns EVERY
@@ -2329,6 +2187,75 @@ std::string HandleRequest(const std::string& request)
     if (request.rfind("CALLDATA ", 0) == 0)
         return HandleCallData(request.substr(9));
 
+    // Cheap loading-screen/churn detector: just the object count, no full
+    // scan. Python polls this a couple times a second and treats a big
+    // swing in a short window as "something is loading right now" (a zone
+    // transition tears down and recreates a large chunk of the object
+    // graph in one burst - see this project's crash-investigation notes,
+    // several confirmed and suspected crashes trace back to scanning/
+    // resolving names during exactly this window) - gates risky scans/
+    // name-resolution calls on the Python side without needing to know
+    // the specific loading-screen widget class for this build/DLC.
+    if (request == "gobjects_count")
+    {
+        TUObjectArray* gObjects = GetGObjects();
+        if (!gObjects)
+            return "ERROR:could not resolve GObjects";
+        int32_t count = 0;
+        if (!TryGetGObjectsCount(gObjects, count))
+            return "ERROR:GObjects count read faulted";
+
+        // Logged every query (not just on toggle) so the debug log itself
+        // shows the loading-window churn pattern over time, independent
+        // of whatever the Python side does with it - useful for
+        // correlating against a crash dump's timestamp after the fact
+        // without needing a separate Python-side log for the same data.
+        static std::atomic<int32_t> s_lastLoggedGObjectsCount{-1};
+        static std::atomic<bool> s_wasChurning{false};
+        int32_t prev = s_lastLoggedGObjectsCount.exchange(count, std::memory_order_relaxed);
+        if (prev >= 0)
+        {
+            int32_t absDelta = (count > prev) ? (count - prev) : (prev - count);
+            double deltaRatio = absDelta / static_cast<double>(prev);
+            bool churning = deltaRatio > 0.03;  // matches Python's LOADING_CHURN_RATIO
+            bool wasChurning = s_wasChurning.exchange(churning, std::memory_order_relaxed);
+            if (churning != wasChurning)
+            {
+                LogLine(std::string("GObjects: ") + (churning ? "started churning (loading window opened) - "
+                        : "settled down (loading window closed) - ") + "count=" + std::to_string(count) +
+                        " (was " + std::to_string(prev) + ", delta=" +
+                        std::to_string(static_cast<int>(deltaRatio * 100)) + "%)");
+            }
+        }
+        return "COUNT:" + std::to_string(count);
+    }
+
+    const std::string setChestReportingPrefix = "set_chest_reporting:";
+    if (request.rfind(setChestReportingPrefix, 0) == 0)
+    {
+        std::string arg = request.substr(setChestReportingPrefix.size());
+        // Optional ":<zone_name>" suffix purely for a more readable log
+        // line - Python already knows the zone, this just carries it
+        // through so the DLL's own log shows WHY, not just WHAT.
+        std::string zoneName;
+        size_t colonPos = arg.find(':');
+        if (colonPos != std::string::npos)
+        {
+            zoneName = arg.substr(colonPos + 1);
+            arg = arg.substr(0, colonPos);
+        }
+        bool newState = (arg == "1");
+        bool oldState = g_chestReportingEnabled.exchange(newState, std::memory_order_relaxed);
+        if (newState != oldState)
+        {
+            std::string zoneSuffix = zoneName.empty() ? "" : (" (zone: " + zoneName + ")");
+            LogLine(std::string("Chest-reporting classifier: ") +
+                    (newState ? "ENABLED - resuming full classification" + zoneSuffix
+                              : "DISABLED - going quiet, skipping name-resolution work for this classifier" + zoneSuffix));
+        }
+        return "OK";
+    }
+
     const std::string resolvePrefix = "resolve_name:";
     if (request.rfind(resolvePrefix, 0) == 0)
         return HandleResolveName(request.substr(resolvePrefix.size()));
@@ -2336,6 +2263,10 @@ std::string HandleRequest(const std::string& request)
     const std::string findByNamePrefix = "find_by_name:";
     if (request.rfind(findByNamePrefix, 0) == 0)
         return HandleFindByName(request.substr(findByNamePrefix.size()));
+
+    const std::string findByClassPrefix = "find_by_class:";
+    if (request.rfind(findByClassPrefix, 0) == 0)
+        return HandleFindByClass(request.substr(findByClassPrefix.size()));
 
     const std::string findOuterPrefix = "find_outer:";
     if (request.rfind(findOuterPrefix, 0) == 0)
@@ -2401,129 +2332,118 @@ void PipeServerThread()
     }
 }
 
-// ---- Present hook setup ----
+// (Present hook removed entirely - see the comment above SetupHookThread.)
 
-typedef HRESULT(__stdcall* PresentFn)(IDXGISwapChain*, UINT, UINT);
-static PresentFn oPresent = nullptr;
+// ---- Present hook: REMOVED ----
+// This used to create a throwaway D3D11 device+swapchain via
+// D3D11CreateDeviceAndSwapChain purely to read Present's address off its
+// vtable, concurrently with the game's own real device/swapchain creation
+// at startup (a Sleep(3000) in SetupHookThread tried to reduce the overlap,
+// but couldn't guarantee it never happens). This is the strongest suspect
+// for a crash a beta tester hit consistently at game startup ("during
+// connection, on construction") - 3 crash dumps with byte-identical
+// offsets, all purely inside Dungeons-Win64-Shipping/driver code with zero
+// dungeons_bridge frames, and the tester confirmed it never happens with
+// the mod NOT injected. A second D3D11 device fighting the game's own for
+// the same GPU/driver resources during its init window is exactly the kind
+// of thing that can fault at the driver level with no attributable stack.
+//
+// The only thing Present was actually used for was draining g_pendingCalls
+// (the CALL/CALLDATA queue) once per frame - see DrainPendingCalls' comment,
+// now called from hkProcessEvent_Impl instead, which needs no throwaway
+// device and was already confirmed firing reliably (including in sessions
+// where GetPresentAddress used to fail anyway, e.g. "Present address not
+// found" in this tester's own log - Present was never reliably available
+// to begin with, on top of being a suspected crash cause).
 
-HRESULT __stdcall hkPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags)
-{
-    DrainPendingCalls();
-    DrainGenericWork();
-    return oPresent(pSwapChain, SyncInterval, Flags);
-}
-
-// Classic pattern: create a throwaway D3D11 device+swapchain just to read
-// Present's real address off its vtable (slot 8) - the function pointer
-// is identical no matter which swapchain instance you get it from, since
-// it's the same code in the same loaded D3D11/DXGI DLL.
-static uintptr_t GetPresentAddress()
-{
-    D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
-    DXGI_SWAP_CHAIN_DESC scd = {};
-    scd.BufferCount = 1;
-    scd.BufferDesc.Width = 100;
-    scd.BufferDesc.Height = 100;
-    scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    scd.BufferDesc.RefreshRate.Numerator = 60;
-    scd.BufferDesc.RefreshRate.Denominator = 1;
-    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    scd.OutputWindow = GetDesktopWindow();
-    scd.SampleDesc.Count = 1;
-    scd.Windowed = TRUE;
-    scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-
-    IDXGISwapChain* pSwapChain = nullptr;
-    ID3D11Device* pDevice = nullptr;
-    ID3D11DeviceContext* pContext = nullptr;
-
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-        &featureLevel, 1, D3D11_SDK_VERSION,
-        &scd, &pSwapChain, &pDevice, nullptr, &pContext);
-
-    if (FAILED(hr) || !pSwapChain)
-        return 0;
-
-    void** vtable = *reinterpret_cast<void***>(pSwapChain);
-    uintptr_t presentAddr = reinterpret_cast<uintptr_t>(vtable[8]); // IDXGISwapChain::Present
-
-    if (pContext) pContext->Release();
-    if (pDevice) pDevice->Release();
-    pSwapChain->Release();
-
-    return presentAddr;
-}
+// Guards against SetupHookThread ever running its hook-installation logic
+// more than once per process lifetime. Root-caused from a real crash dump:
+// the debug log showed 2 fully-successful SetupHookThread sessions in a row
+// with the IDENTICAL ProcessEvent target address (same live process, not a
+// real relaunch - see is_dll_loaded's own false-negative comment on the
+// Python side, which reduces but doesn't guarantee this never happens), then
+// a 3rd attempt that crashed inside MinHook's own trampoline buffer
+// allocator (VirtualAlloc/VirtualQuery, resolved from the crash dump's
+// import thunks). MinHook's global hook table isn't designed to have
+// MH_CreateHook called again for a target it's already hooked without an
+// MH_RemoveHook/MH_Uninitialize in between - this makes that a no-op instead
+// of undefined behavior, independent of whether the Python-side retry above
+// ever eliminates the false-negative that triggers a redundant injection.
+static std::atomic<bool> g_hooksAlreadySetUp{false};
 
 void SetupHookThread()
 {
-    LogLine("=== SetupHookThread starting (new session) === PID=" + std::to_string(GetCurrentProcessId()));
+    if (g_hooksAlreadySetUp.exchange(true))
+    {
+        LogLine("=== SetupHookThread called again in an already-hooked process - skipping "
+                 "(MinHook's hook table isn't safe to re-initialize without an uninstall first). ===");
+        return;
+    }
+
+    LogLine("=== SetupHookThread starting (new session) ===");
     ReadGameStoreConfig();  // must run before ANY Offsets::Active.* usage below
-    // Small delay so we're not racing the game's own D3D init too early
-    Sleep(3000);
+    // Small delay so classification/hooking doesn't start before the game's
+    // own early init has had a chance to settle.
+    Sleep(8000);  // widened from 3000 - see LogLine's PID+timestamp comment:
+    // this crash (SecondsSinceStart=0, specifically when the client is
+    // already attached before the game launches) persisted even with
+    // wait_for_process_ready() gating injection on user32.dll being
+    // loaded, so the original 3s guess wasn't the whole story. Not a
+    // confirmed fix, just a wider safety margin while PID+timestamped
+    // logs (new) make the next crash dump actually correlatable.
 
     MH_STATUS initStatus = MH_Initialize();
     LogLine("MH_Initialize status: " + std::to_string(static_cast<int>(initStatus)));
     if (initStatus != MH_OK)
         return;
 
-    uintptr_t presentAddr = GetPresentAddress();
-    if (presentAddr)
-    {
-        MH_STATUS presentStatus = MH_CreateHook(reinterpret_cast<void*>(presentAddr), &hkPresent,
-                      reinterpret_cast<void**>(&oPresent));
-        LogLine("Present hook MH_CreateHook status: " + std::to_string(static_cast<int>(presentStatus)));
-        // don't bail out here if this fails - still try the currency hook below
-    }
-    else
-    {
-        LogLine("Present address not found (D3D11CreateDeviceAndSwapChain failed)");
-    }
+    // Currency hook REMOVED: the pattern-scanned "generic getter" this
+    // used to install on was real (a genuine function head), but NOT
+    // actually UWalletComponent's currency getter - it was some other,
+    // extremely hot per-frame native getter that happens to compile to
+    // the exact same trivial `mov eax,[rcx+8]; ret` shape. Hooking it
+    // was stable at install time but crashed the game once that
+    // unrelated hot path actually ran. Not needed anyway: currency is
+    // already read via UWalletComponent::Balance() through ProcessEvent
+    // (the CALL/CALLDATA path below), which doesn't need this hook at
+    // all.
 
-    // The currency-pointer hook that used to live here has been removed
-    // entirely - REMOVED, not just disabled, because of what it hooked:
-    // a 6-byte byte pattern (`mov eax,[rcx+8]; ret`) admittedly too
-    // generic to reliably identify the real currency getter (a live
-    // cross-check once found it was actually capturing Eyes of Ender,
-    // not the shared wallet getter it was assumed to be) - the compiled
-    // shape of ANY trivial int32 getter in the whole game binary, not
-    // something unique to currency. Confirmed as the actual cause of a
-    // deterministic, 100%-reproducible game crash (identical
-    // PCallStackHash across multiple UE4 crash reports, at the end of a
-    // mission's loading screen): this hook was installed on a FUNCTION
-    // CALLED CONSTANTLY BY THE GAME'S OWN UI - if the pattern matched
-    // anything other than the real currency getter (very plausible,
-    // given how generic it is), every one of the game's own calls to
-    // that address went through our detour with wrong assumptions about
-    // its actual signature/calling convention, corrupting the game's own
-    // execution deterministically and immediately. Nothing on the Python
-    // side has consumed this hook's captured pointer since the emerald
-    // system moved to calling the real UWalletComponent::ClientAdd/Balance
-    // UFUNCTIONs via ProcessEvent instead (see dungeons_reader.py) - so
-    // this hook was pure risk with zero remaining benefit.
-
-    // ProcessEvent hook REMOVED entirely - confirmed as the crash source
-    // (see ISOLATION TEST ROUND 3's comment on hkProcessEvent above:
-    // stripped to a bare passthrough body, still crashed with the
-    // identical PCallStackHash, ruling out everything the hook body does
-    // and leaving only the hook's install point on this single, always-
-    // firing, engine-wide address implicated). hkProcessEvent itself is
-    // left defined above for reference but is no longer installed here.
+    // ProcessEvent hook for chest-open detection. Same RVA GetProcessEventFn()
+    // already uses for the CALL/CALLDATA path - after this hook is installed,
+    // that path naturally starts going through hkProcessEvent too (which
+    // just forwards to oProcessEvent when it's not an OnOpenLootChest call),
+    // so nothing about the existing CALL functionality changes.
     //
-    // Replaced by targeted UFunction::ExecFunction hooks, installed only
-    // on the specific Interact-family functions that need pickup-tier
-    // blocking - see the "Targeted ExecFunction hooking" module comment
-    // above ExecFunctionBlockCommon for the full reasoning. First sweep
-    // runs as soon as the engine is ready (ExecSweepThread gates on
-    // IsEngineReadyForClassification itself, so no readiness check is
-    // needed here), then re-sweeps periodically to catch classes that
-    // stream in later.
+    // ISOLATION TEST TOGGLE - added to get a real, first-party answer for
+    // THIS codebase about whether installing this specific hook is what
+    // causes the recurring GameThread crashes (PCallStackHash values seen
+    // so far: 0B18377984335DEE923A1E29FD568BFBF5F379AF and
+    // A3D4B2C4B9A67CD3F78D1BBF39B8F686BCA73B30 - two DIFFERENT hashes,
+    // neither showing any dungeons_bridge.dll frame on the crashing
+    // GameThread's own stack in either crash report). That's genuinely
+    // inconclusive either way - no smoking gun pointing at this hook, but
+    // also no proof it's innocent, since a hook-caused memory corruption
+    // can crash somewhere unrelated-looking later. This flag is the only
+    // way to actually find out: set to 1, rebuild, play a normal session,
+    // and see whether either crash hash still reproduces. If it does -
+    // this hook is cleared, the cause is elsewhere (base game or
+    // something else entirely). If it doesn't - that's real evidence
+    // pointing back at this install point specifically.
     //
-    // GetProcessEventFn()'s CALL/CALLDATA remote-call path (used by e.g.
-    // call_is_mission_completed on the Python side) calls the real
-    // ProcessEvent directly and was never routed through hkProcessEvent's
-    // hook - removing the hook doesn't affect it at all.
-    std::thread(ExecSweepThread).detach();
+    // Chest-open detection (get_chest_events) and the CALL/CALLDATA path's
+    // OnOpenLootChest-style classification stop working while this is set
+    // to 1 - expected and fine for a short isolation-test session, not a
+    // permanent trade-off.
+#define ISOLATION_TEST_SKIP_PROCESSEVENT_HOOK 0
+#if ISOLATION_TEST_SKIP_PROCESSEVENT_HOOK
+    LogLine("ISOLATION TEST: skipping ProcessEvent hook installation entirely.");
+#else
+    uintptr_t peAddr = GetImageBase() + Offsets::Active.ProcessEvent;
+    LogLine("ProcessEvent target address: 0x" + [&]{ std::ostringstream o; o << std::hex << peAddr; return o.str(); }());
+    MH_STATUS peStatus = MH_CreateHook(reinterpret_cast<void*>(peAddr),
+                  &hkProcessEvent, reinterpret_cast<void**>(&oProcessEvent));
+    LogLine("ProcessEvent hook MH_CreateHook status: " + std::to_string(static_cast<int>(peStatus)));
+#endif
 
     MH_STATUS enableStatus = MH_EnableHook(MH_ALL_HOOKS);
     LogLine("MH_EnableHook(MH_ALL_HOOKS) status: " + std::to_string(static_cast<int>(enableStatus)));
