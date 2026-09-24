@@ -617,6 +617,59 @@ static bool TryProcessEventCall(uintptr_t objectAddr, uintptr_t functionAddr, ui
     }
 }
 
+// One-time (cached) lookup of AStorableItem::TimeToPoolFinished's UFunction
+// address via a GObjects scan, reusing the exact same protected primitives
+// HandleFindByName already uses. We only need this because HandleInteraction
+// (native, pooled - see TimeToPool/InstanceClass/ReInitialiseItemBP in the
+// SDK dump) is what normally advances the item's pooling bookkeeping, and
+// blocking it outright (confirmed by the BLOCKED-TEST build) leaves that
+// bookkeeping half-done, which then faults the engine at the next zone
+// transition when it tears down every actor. Calling TimeToPoolFinished
+// ourselves - same as what happens when the item's own TimeToPool timer
+// naturally expires - lets the item repool cleanly without ever running
+// HandleInteraction's effect/grant logic, so the gating still holds. Called
+// synchronously from the game thread (inside hkProcessEvent_Impl) - no
+// thread-hop needed, unlike HandleFindByName which serves cross-thread
+// (pipe) requests.
+static std::atomic<uintptr_t> g_timeToPoolFinishedFn{0};
+
+static uintptr_t ResolveTimeToPoolFinishedFn()
+{
+    uintptr_t cached = g_timeToPoolFinishedFn.load(std::memory_order_relaxed);
+    if (cached != 0)
+        return cached;
+
+    TUObjectArray* gObjects = GetGObjects();
+    if (!gObjects)
+        return 0;
+
+    int32_t total = 0;
+    if (!TryGetGObjectsCount(gObjects, total))
+        return 0;  // mid zone-transition - caller just skips repooling this once, tries again next call
+
+    for (int32_t i = 0; i < total; ++i)
+    {
+        void* objPtr = nullptr;
+        if (!TryGetByIndexSafe(gObjects, i, objPtr) || !objPtr)
+            continue;
+
+        std::string name;
+        if (!TryGetObjectName(objPtr, name))
+            continue;
+
+        if (name == "TimeToPoolFinished")
+        {
+            uintptr_t addr = reinterpret_cast<uintptr_t>(objPtr);
+            g_timeToPoolFinishedFn.store(addr, std::memory_order_relaxed);
+            LogLine("Resolved TimeToPoolFinished UFunction (repool-on-block enabled)");
+            return addr;
+        }
+    }
+
+    LogLine("WARNING: TimeToPoolFinished not found in GObjects - repool-on-block disabled, falling back to plain block");
+    return 0;
+}
+
 // Runs INSIDE the Present hook - i.e. on the correct thread. Drains
 // whatever's queued and services each one synchronously before letting
 // the frame continue.
@@ -1475,17 +1528,41 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
             int unlocked = g_pickupUnlockTier.load(std::memory_order_relaxed);
             if (tier > 0 && tier > unlocked)
             {
-                // TEST BUILD: reverted to the original unconditional block,
-                // on purpose, to isolate whether blocking HandleInteraction
-                // itself (vs. the null-interactor neutering we tried) is
-                // what's producing the transition-time crash. Logged as
-                // "BLOCKED-TEST" (not the old "BLOCKED") so this build's
-                // log lines are unambiguous against earlier logs.
+                // Confirmed by the BLOCKED-TEST build: skipping HandleInteraction
+                // outright doesn't fault immediately, but leaves the item's
+                // pooling bookkeeping incomplete, which then crashes the engine
+                // at the next zone transition. Still block the real call (so
+                // the effect/grant never runs - gating stays intact), but for
+                // HandleInteraction specifically, immediately follow it with a
+                // manual TimeToPoolFinished() call on the same actor so the
+                // item repools cleanly, same as if its own timer had expired.
                 std::string funcName;
                 TryGetObjectName(function, funcName);
                 blocked = true;
-                LogLine("BLOCKED-TEST pickup (tier " + std::to_string(tier) + " > unlocked " +
-                         std::to_string(unlocked) + ", func=" + funcName + "): " + className);
+
+                if (funcName == "HandleInteraction")
+                {
+                    uintptr_t poolFn = ResolveTimeToPoolFinishedFn();
+                    if (poolFn != 0 && self != nullptr)
+                    {
+                        DWORD excCode = 0;
+                        bool ok = TryProcessEventCall(reinterpret_cast<uintptr_t>(self), poolFn, nullptr, excCode);
+                        LogLine("BLOCKED+REPOOLED pickup (tier " + std::to_string(tier) + " > unlocked " +
+                                 std::to_string(unlocked) + "): " + className +
+                                 (ok ? " [repool ok]" : " [repool FAILED 0x" + std::to_string(excCode) + "]"));
+                    }
+                    else
+                    {
+                        LogLine("BLOCKED pickup (tier " + std::to_string(tier) + " > unlocked " +
+                                 std::to_string(unlocked) + "), func=" + funcName +
+                                 " [repool skipped - function not resolved]: " + className);
+                    }
+                }
+                else
+                {
+                    LogLine("BLOCKED pickup (tier " + std::to_string(tier) + " > unlocked " +
+                             std::to_string(unlocked) + ", func=" + funcName + "): " + className);
+                }
             }
         }
     }
