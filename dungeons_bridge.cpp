@@ -265,6 +265,111 @@ static uint64_t GetCurrentWorldPtr()
     return *reinterpret_cast<uint64_t*>(GetImageBase() + Offsets::GWorld);
 }
 
+// ---- Autonomous hook silence / re-arm -------------------------------------
+// Replaces the old "HOOK SILENT" scheme (hook created but NOT enabled, waiting
+// for a reenable_hook pipe command). That design could never wake itself: with
+// the hook disabled, no code of ours ran inside the game, so re-arming
+// depended entirely on an external pipe command that never came.
+//
+// Here the ProcessEvent hook stays installed and enabled FOR THE WHOLE
+// SESSION (no MH_EnableHook/MH_DisableHook at runtime - MinHook freezes every
+// thread to patch, which is itself a bad thing to do mid level-load). "Silent"
+// is only an atomic flag checked at the very top of hkProcessEvent: while it
+// is set, the hook does nothing but forward to the original ProcessEvent (no
+// queue draining, no classification, no name resolution, no blocking), and
+// the pipe handlers that would touch the game (CALL/CALLDATA/resolve/find)
+// answer "ERROR:..." immediately instead of queueing work.
+//
+// Because the check lives in the hook itself, re-arming needs nothing from
+// outside. Three independent ways back to ACTIVE, any one is enough:
+//   1. world-stable : GWorld non-null and unchanged for SILENCE_SETTLE_MS
+//   2. deadman cap  : silent for SILENCE_MAX_MS no matter what (cannot get stuck)
+//   3. hook_wake    : optional pipe command, convenience only - never required
+// Silence starts (a) at hook install, (b) whenever GWorld changes or goes
+// null (level transition), (c) on the optional hook_silence <ms> command.
+static const ULONGLONG SILENCE_SETTLE_MS = 4000;    // world must sit still this long
+static const ULONGLONG SILENCE_MAX_MS    = 30000;   // absolute cap per silent window
+static const ULONGLONG SILENCE_FORCE_MAX = 30000;   // cap on hook_silence <ms>
+
+static std::atomic<bool>      g_hookSilent{ true };
+static std::atomic<ULONGLONG> g_silentSince{ 0 };
+static std::atomic<ULONGLONG> g_lastWorldChange{ 0 };
+static std::atomic<uint64_t>  g_lastSeenWorld{ 0 };
+static std::atomic<ULONGLONG> g_forceSilentUntil{ 0 };
+
+static void SilenceLog(const char* what, uint64_t world, ULONGLONG ms)
+{
+    std::ostringstream o;
+    o << "HOOK " << what << " (world=0x" << std::hex << world << std::dec << ", " << ms << " ms)";
+    LogLine(o.str());
+}
+
+// Returns true while the hook must stay silent. Safe from any thread; only the
+// hook thread normally drives it, pipe handlers call it read-mostly.
+static bool EvaluateSilence()
+{
+    const ULONGLONG now = GetTickCount64();
+    const uint64_t world = GetCurrentWorldPtr();
+    const uint64_t prevWorld = g_lastSeenWorld.exchange(world, std::memory_order_relaxed);
+    bool silent = g_hookSilent.load(std::memory_order_relaxed);
+
+    // Deadman first: a silent window can never outlive SILENCE_MAX_MS, even if
+    // the world pointer keeps changing the whole time.
+    if (silent && now - g_silentSince.load(std::memory_order_relaxed) >= SILENCE_MAX_MS)
+    {
+        g_hookSilent.store(false, std::memory_order_relaxed);
+        g_lastWorldChange.store(now, std::memory_order_relaxed);
+        SilenceLog("ACTIVE: deadman cap reached", world, now - g_silentSince.load(std::memory_order_relaxed));
+        return false;
+    }
+
+    if (world != prevWorld)                       // level transition begins / continues
+    {
+        g_lastWorldChange.store(now, std::memory_order_relaxed);
+        if (!silent)
+        {
+            g_silentSince.store(now, std::memory_order_relaxed);
+            g_hookSilent.store(true, std::memory_order_relaxed);
+            SilenceLog("SILENT: world changed", world, 0);
+        }
+        return true;
+    }
+
+    if (now < g_forceSilentUntil.load(std::memory_order_relaxed))
+    {
+        if (!silent)
+        {
+            g_silentSince.store(now, std::memory_order_relaxed);
+            g_hookSilent.store(true, std::memory_order_relaxed);
+            SilenceLog("SILENT: forced by hook_silence", world, 0);
+        }
+        return true;
+    }
+
+    if (!silent)
+        return false;
+
+    const ULONGLONG since = g_silentSince.load(std::memory_order_relaxed);
+    const ULONGLONG lastChange = g_lastWorldChange.load(std::memory_order_relaxed);
+    if (world != 0 && now - lastChange >= SILENCE_SETTLE_MS)
+    {
+        g_hookSilent.store(false, std::memory_order_relaxed);
+        SilenceLog("ACTIVE: world stable", world, now - since);
+        return false;
+    }
+    return true;
+}
+
+static void InitSilenceAtInstall()
+{
+    const ULONGLONG now = GetTickCount64();
+    g_lastSeenWorld.store(GetCurrentWorldPtr(), std::memory_order_relaxed);
+    g_lastWorldChange.store(now, std::memory_order_relaxed);
+    g_silentSince.store(now, std::memory_order_relaxed);
+    g_forceSilentUntil.store(0, std::memory_order_relaxed);
+    g_hookSilent.store(true, std::memory_order_relaxed);
+}
+
 static TUObjectArray* GetGObjects()
 {
     InitOffsetsForHost();
@@ -1591,6 +1696,14 @@ void LogProcessEventException()
 
 void hkProcessEvent(void* self, void* function, void* params)
 {
+    // Silent window (startup / level transition): pure pass-through, nothing
+    // else of ours runs. See "Autonomous hook silence / re-arm" above.
+    if (EvaluateSilence())
+    {
+        oProcessEvent(self, function, params);
+        return;
+    }
+
     bool blocked = false;
     __try
     {
@@ -1868,6 +1981,45 @@ std::string HandleRequest(const std::string& request)
         return out.str();
     }
 
+    // ---- hook silence control (all optional - the hook re-arms by itself) ----
+    if (request == "hook_state")
+    {
+        EvaluateSilence();
+        std::ostringstream out;
+        out << "HOOK:" << (g_hookSilent.load() ? "silent" : "active")
+            << ",silent_ms=" << (g_hookSilent.load() ? (GetTickCount64() - g_silentSince.load()) : 0)
+            << ",world=0x" << std::hex << g_lastSeenWorld.load();
+        return out.str();
+    }
+    if (request == "hook_wake")
+    {
+        g_forceSilentUntil.store(0);
+        g_hookSilent.store(false);
+        LogLine("HOOK ACTIVE: hook_wake command");
+        return "OK";
+    }
+    if (request.rfind("hook_silence ", 0) == 0)
+    {
+        try
+        {
+            ULONGLONG ms = std::stoull(request.substr(13));
+            if (ms > SILENCE_FORCE_MAX) ms = SILENCE_FORCE_MAX;
+            g_forceSilentUntil.store(GetTickCount64() + ms);
+            return "OK";
+        }
+        catch (...) { return "ERROR: invalid hook_silence value"; }
+    }
+
+    // While silent, anything that would touch the game (queued CALLs, name
+    // resolution, GObjects walks) is refused immediately with a normal
+    // ERROR: string - callers already treat those as "retry next tick".
+    const bool touchesGame =
+        request.rfind("CALL ", 0) == 0 || request.rfind("CALLDATA ", 0) == 0 ||
+        request.rfind("resolve_name:", 0) == 0 || request.rfind("find_by_name:", 0) == 0 ||
+        request.rfind("find_outer:", 0) == 0;
+    if (touchesGame && EvaluateSilence())
+        return "ERROR:hook silent (game loading/transition) - retry shortly";
+
     if (request.rfind("CALL ", 0) == 0)
         return HandleCall(request.substr(5));
 
@@ -2005,6 +2157,11 @@ void SetupHookThread()
     MH_STATUS peStatus = MH_CreateHook(reinterpret_cast<void*>(peAddr),
                   reinterpret_cast<void*>(&hkProcessEvent), reinterpret_cast<void**>(&oProcessEvent));
     LogLine("ProcessEvent hook MH_CreateHook status: " + std::to_string(static_cast<int>(peStatus)));
+
+    // Start SILENT (flag only): the hook is enabled for good right below and
+    // never toggled again; it wakes itself once the world has been stable.
+    InitSilenceAtInstall();
+    LogLine("HOOK SILENT at install - will self-activate after the world is stable (or after the deadman cap).");
 
     MH_STATUS enableStatus = MH_EnableHook(MH_ALL_HOOKS);
     LogLine("MH_EnableHook(MH_ALL_HOOKS) status: " + std::to_string(static_cast<int>(enableStatus)));
