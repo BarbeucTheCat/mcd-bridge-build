@@ -77,18 +77,24 @@ static const wchar_t* GetPipeName()
     return g_pipeName.c_str();
 }
 
-// ---- Copied directly from the real Dumper-7 Basic.hpp - not guessed ----
+// ---- RVAs of the engine globals/functions this DLL uses ----
+// These are NOT the same across game builds: the Steam build
+// (Dungeons-Win64-Shipping.exe) was updated and its engine globals moved
+// (Steam gworld 0x4795230 vs 0x47540B0 on the Microsoft Store / Minecraft
+// Launcher build, see STORE_OFFSETS in dungeons_reader.py). This DLL used to
+// hard-code the Microsoft Store values, so on Steam it called AppendString
+// at an address that is not AppendString there - the crash dumps from Steam
+// show the faulting instruction at exactly image base + 0x10BF7C8, i.e.
+// the Microsoft Store AppendString RVA (0x10BF7C0) + 8. The values are now
+// filled in once by InitOffsetsForHost() from the host exe's name. 0 means
+// "unknown for this build - do not use": every getter below returns null for
+// a 0 offset and every caller already handles that.
 namespace Offsets
 {
-    constexpr int32_t GObjects = 0x046556C8;
-    constexpr int32_t AppendString = 0x010BF7C0;
-    constexpr int32_t ProcessEvent = 0x01244C30; // direct RVA, confirmed from Basic.hpp - the
-                                                  // vtable-slot-64 guess was wrong, this is the
-                                                  // real deal, threading was the actual problem
-    constexpr int32_t GWorld = 0x047540B0;       // MUST match dungeons_reader.py's OFFSETS["gworld"]
-                                                  // exactly - both read the same global pointer, just
-                                                  // from inside (this DLL) vs outside (pymem) the process.
-                                                  // Update both together if it ever changes.
+    static int32_t GObjects = 0;
+    static int32_t AppendString = 0;
+    static int32_t ProcessEvent = 0;
+    static int32_t GWorld = 0;
 }
 
 struct FUObjectItem
@@ -184,26 +190,102 @@ static uintptr_t GetImageBase()
     return reinterpret_cast<uintptr_t>(GetModuleHandle(0));
 }
 
+struct StoreOffsets
+{
+    const char* label;
+    int32_t gobjects, appendString, processEvent, gworld;
+};
+
+// Microsoft Store + Minecraft Launcher (Dungeons.exe): all four values copied
+// from a real Dumper-7 dump of the MS Store build's Basic.hpp.
+static const StoreOffsets kOffsetsMsStore = {
+    "microsoft_store / minecraft_launcher (Dungeons.exe)",
+    0x046556C8, 0x010BF7C0, 0x01244C30, 0x047540B0 };
+
+// Steam (Dungeons-Win64-Shipping.exe). gobjects/gworld: STORE_OFFSETS["steam"]
+// in dungeons_reader.py (from Dumper-7's OffsetsInfo.json). processEvent
+// 0x01246E10: derived from an older Steam session's log ("ProcessEvent target
+// address 0x7ff7276a6e10") and the crash dump of that same process (image
+// base ...26460000) - cross-checked, but not read from a Steam Dumper-7 dump.
+// appendString: NOT KNOWN for the Steam build yet - left at 0 on purpose
+// rather than guessed. With 0, name resolution is disabled on Steam (the hook
+// still forwards calls and drains queued item grants, but nothing that needs
+// a name - pickup blocking, chest/boss/secret detection - can run) instead of
+// calling a wrong address. Fill in OFFSET_APPENDSTRING from the Steam dump.
+static const StoreOffsets kOffsetsSteam = {
+    "steam (Dungeons-Win64-Shipping.exe)",
+    0x04696848, 0 /* appendString: unknown */, 0x01246E10, 0x04795230 };
+
+static std::once_flag g_offsetsOnce;
+
+static void InitOffsetsForHost()
+{
+    std::call_once(g_offsetsOnce, []()
+    {
+        char path[MAX_PATH] = { 0 };
+        DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
+        std::string exe = (n > 0 && n < MAX_PATH) ? std::string(path) : std::string();
+        size_t slash = exe.find_last_of("\\/");
+        if (slash != std::string::npos)
+            exe = exe.substr(slash + 1);
+        for (auto& c : exe)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        const StoreOffsets* chosen = nullptr;
+        if (exe == "dungeons-win64-shipping.exe")
+            chosen = &kOffsetsSteam;
+        else if (exe == "dungeons.exe")
+            chosen = &kOffsetsMsStore;
+
+        if (!chosen)
+        {
+            LogLine("Offsets: host exe '" + exe + "' is not a known build - ALL offsets left at 0, "
+                    "this DLL will stay passive (no hooks, no engine calls).");
+            return;
+        }
+        Offsets::GObjects = chosen->gobjects;
+        Offsets::AppendString = chosen->appendString;
+        Offsets::ProcessEvent = chosen->processEvent;
+        Offsets::GWorld = chosen->gworld;
+        LogLine(std::string("Offsets: using the ") + chosen->label + " set (host exe '" + exe + "').");
+        if (!Offsets::AppendString)
+            LogLine("Offsets: AppendString RVA is unknown for this build - name resolution disabled, "
+                    "pickup blocking and chest/boss/secret detection are inert until it is filled in.");
+    });
+}
+
 static uint64_t GetCurrentWorldPtr()
 {
     // Read directly - this code runs INSIDE the target process (injected),
     // so no cross-process ReadProcessMemory is needed, unlike pymem's
     // out-of-process reads of this exact same global on the Python side.
+    InitOffsetsForHost();
+    if (!Offsets::GWorld)
+        return 0;
     return *reinterpret_cast<uint64_t*>(GetImageBase() + Offsets::GWorld);
 }
 
 static TUObjectArray* GetGObjects()
 {
+    InitOffsetsForHost();
+    if (!Offsets::GObjects)
+        return nullptr;
     return reinterpret_cast<TUObjectArray*>(GetImageBase() + Offsets::GObjects);
 }
 
 static AppendStringFn GetAppendStringFn()
 {
+    InitOffsetsForHost();
+    if (!Offsets::AppendString)
+        return nullptr;
     return reinterpret_cast<AppendStringFn>(GetImageBase() + Offsets::AppendString);
 }
 
 static ProcessEventFn GetProcessEventFn()
 {
+    InitOffsetsForHost();
+    if (!Offsets::ProcessEvent)
+        return nullptr;
     return reinterpret_cast<ProcessEventFn>(GetImageBase() + Offsets::ProcessEvent);
 }
 
@@ -213,9 +295,12 @@ static bool TryResolveName(int32_t comparisonIndex, wchar_t* outBuffer, int32_t 
 {
     __try
     {
+        AppendStringFn appendString = GetAppendStringFn();
+        if (!appendString)
+            return false;   // AppendString RVA unknown for this build - never call a guessed address
         SimpleFName name{ comparisonIndex, 0 };
         SimpleFString str{ outBuffer, 0, bufferSize };
-        GetAppendStringFn()(&name, str);
+        appendString(&name, str);
         outLen = str.Num;
         return true;
     }
@@ -567,7 +652,13 @@ static bool TryProcessEventCall(uintptr_t objectAddr, uintptr_t functionAddr, ui
     DWORD code = 0;
     __try
     {
-        GetProcessEventFn()(reinterpret_cast<void*>(objectAddr), reinterpret_cast<void*>(functionAddr), parms);
+        ProcessEventFn pe = GetProcessEventFn();
+        if (!pe)
+        {
+            outExceptionCode = 0xE0000001;   // private code: no ProcessEvent RVA for this build
+            return false;
+        }
+        pe(reinterpret_cast<void*>(objectAddr), reinterpret_cast<void*>(functionAddr), parms);
         return true;
     }
     __except ((code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
@@ -1885,6 +1976,13 @@ void SetupHookThread()
     // Small delay so classification/hooking doesn't start before the game's
     // own early init has had a chance to settle.
     Sleep(3000);
+
+    InitOffsetsForHost();
+    if (!Offsets::ProcessEvent)
+    {
+        LogLine("SetupHookThread: no ProcessEvent RVA for this host - installing NO hooks (passive).");
+        return;
+    }
 
     MH_STATUS initStatus = MH_Initialize();
     LogLine("MH_Initialize status: " + std::to_string(static_cast<int>(initStatus)));
