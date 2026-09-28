@@ -89,18 +89,6 @@ namespace Offsets
                                                   // exactly - both read the same global pointer, just
                                                   // from inside (this DLL) vs outside (pymem) the process.
                                                   // Update both together if it ever changes.
-
-    // Game-logic field offsets (Blueprint/native class layout, NOT engine
-    // globals) - same World->GameInstance->LocalPlayers[0]->PlayerController
-    // ->Pawn chain as dungeons_reader.py's get_pawn(), same values as its
-    // OFFSETS dict ("game_instance"/"local_players"/"player_controller"/
-    // "pawn"). Treated as shared across store channels there (only GWorld/
-    // GObjects are known to drift per-channel) - used here only for the
-    // cheap "is a local pawn actually up right now" check below.
-    constexpr int32_t GameInstance = 0x160;
-    constexpr int32_t LocalPlayers = 0x38;
-    constexpr int32_t PlayerController = 0x30;
-    constexpr int32_t Pawn = 0x360;
 }
 
 struct FUObjectItem
@@ -201,20 +189,7 @@ static uint64_t GetCurrentWorldPtr()
     // Read directly - this code runs INSIDE the target process (injected),
     // so no cross-process ReadProcessMemory is needed, unlike pymem's
     // out-of-process reads of this exact same global on the Python side.
-    // Wrapped in __try/__except like every other raw read in this file -
-    // this one was missed in earlier passes despite GWorld mid-teardown
-    // being explicitly called out as a risk in TryGetLocalPawn's comment.
-    // Called from CaptureInteractEvent, on the hot path of every chest/
-    // interact report, with no outer protection above it - a fault here
-    // used to be completely uncaught.
-    __try
-    {
-        return *reinterpret_cast<uint64_t*>(GetImageBase() + Offsets::GWorld);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return 0;
-    }
+    return *reinterpret_cast<uint64_t*>(GetImageBase() + Offsets::GWorld);
 }
 
 static TUObjectArray* GetGObjects()
@@ -294,34 +269,6 @@ static bool TryGetByIndexSafe(TUObjectArray* arr, int32_t index, void*& outPtr)
     __try
     {
         outPtr = arr->GetByIndex(index);
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-}
-
-// AStorableItem::HandleInteraction(ACharacter* interactor) is a NATIVE
-// pooled-actor function (see TimeToPool/InstanceClass/ReInitialiseItemBP
-// in the SDK dump) - unlike the OnInteract/OnInteracted Blueprint-graph
-// delegates, skipping this call entirely via blockedOut leaves the
-// item's own pooling bookkeeping half-advanced, which is the leading
-// suspect for the level-transition crash (100% engine-frame crash stack,
-// immediately preceded by a burst of blocked HandleInteraction calls).
-// Instead of skipping the call, we let it run but null out its sole
-// parameter (the interactor pointer) at Params+0x0 - the same "no valid
-// actor = nothing to do" pattern TryGetLocalPawn relies on elsewhere in
-// this file. This is a hypothesis based on the SDK signature, NOT
-// confirmed against a disassembly of HandleInteraction's body - it
-// should be verified against the debug log (no more BLOCKED pickup
-// crashes, and no new complaints about tier-locked items still granting
-// their effect) before being trusted as the permanent fix.
-static bool TryNullFirstParamPointer(void* params)
-{
-    __try
-    {
-        *reinterpret_cast<uint64_t*>(params) = 0;
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -470,31 +417,6 @@ static void QueueAndWaitForRenderThread(const std::function<void()>& work)
     localCv->wait_for(lock, std::chrono::seconds(10), [&] { return *done; });
 }
 
-// Isolated POD-only helper - same MSVC C2712 reasoning as TryMatchPatternAt/
-// TryProcessEventCall above (__try can't coexist with a function that also
-// owns a C++ object needing unwinding in its own frame - work is a
-// reference, not owned here, so this is fine). Unlike every other memory-
-// touching loop in this file (DrainPendingCalls via TryProcessEventCall,
-// every GObjects walk via TryGetByIndexSafe/TryGetObjectName, the AOB scan
-// via TryMatchPatternAt), DrainGenericWork used to run its queued lambdas
-// completely unprotected - fine today only because every current producer
-// (HandleResolveName, HandleFindByName) happens to individually SEH-wrap
-// its own risky reads already, but a future queued lambda that doesn't
-// would fault the whole game thread with no net to catch it, unlike
-// everywhere else in this file.
-static bool TryRunGenericWork(const std::function<void()>& work)
-{
-    __try
-    {
-        work();
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-}
-
 static void DrainGenericWork()
 {
     std::queue<std::function<void()>> localQueue;
@@ -504,12 +426,7 @@ static void DrainGenericWork()
     }
     while (!localQueue.empty())
     {
-        if (!TryRunGenericWork(localQueue.front()))
-        {
-            LogLine("WARNING: a queued generic-work item faulted and was caught here "
-                     "(would have crashed the game thread otherwise) - whatever cross-"
-                     "thread request this was will likely time out on the Python side.");
-        }
+        localQueue.front()();
         localQueue.pop();
     }
 }
@@ -660,59 +577,6 @@ static bool TryProcessEventCall(uintptr_t objectAddr, uintptr_t functionAddr, ui
     }
 }
 
-// One-time (cached) lookup of AStorableItem::TimeToPoolFinished's UFunction
-// address via a GObjects scan, reusing the exact same protected primitives
-// HandleFindByName already uses. We only need this because HandleInteraction
-// (native, pooled - see TimeToPool/InstanceClass/ReInitialiseItemBP in the
-// SDK dump) is what normally advances the item's pooling bookkeeping, and
-// blocking it outright (confirmed by the BLOCKED-TEST build) leaves that
-// bookkeeping half-done, which then faults the engine at the next zone
-// transition when it tears down every actor. Calling TimeToPoolFinished
-// ourselves - same as what happens when the item's own TimeToPool timer
-// naturally expires - lets the item repool cleanly without ever running
-// HandleInteraction's effect/grant logic, so the gating still holds. Called
-// synchronously from the game thread (inside hkProcessEvent_Impl) - no
-// thread-hop needed, unlike HandleFindByName which serves cross-thread
-// (pipe) requests.
-static std::atomic<uintptr_t> g_timeToPoolFinishedFn{0};
-
-static uintptr_t ResolveTimeToPoolFinishedFn()
-{
-    uintptr_t cached = g_timeToPoolFinishedFn.load(std::memory_order_relaxed);
-    if (cached != 0)
-        return cached;
-
-    TUObjectArray* gObjects = GetGObjects();
-    if (!gObjects)
-        return 0;
-
-    int32_t total = 0;
-    if (!TryGetGObjectsCount(gObjects, total))
-        return 0;  // mid zone-transition - caller just skips repooling this once, tries again next call
-
-    for (int32_t i = 0; i < total; ++i)
-    {
-        void* objPtr = nullptr;
-        if (!TryGetByIndexSafe(gObjects, i, objPtr) || !objPtr)
-            continue;
-
-        std::string name;
-        if (!TryGetObjectName(objPtr, name))
-            continue;
-
-        if (name == "TimeToPoolFinished")
-        {
-            uintptr_t addr = reinterpret_cast<uintptr_t>(objPtr);
-            g_timeToPoolFinishedFn.store(addr, std::memory_order_relaxed);
-            LogLine("Resolved TimeToPoolFinished UFunction (repool-on-block enabled)");
-            return addr;
-        }
-    }
-
-    LogLine("WARNING: TimeToPoolFinished not found in GObjects - repool-on-block disabled, falling back to plain block");
-    return 0;
-}
-
 // Runs INSIDE the Present hook - i.e. on the correct thread. Drains
 // whatever's queued and services each one synchronously before letting
 // the frame continue.
@@ -842,22 +706,7 @@ std::string HandleCallData(const std::string& args)
     for (size_t i = 0; i < parmsSize; ++i)
     {
         std::string byteStr = parmsHex.substr(i * 2, 2);
-        try
-        {
-            req->parms[i] = static_cast<uint8_t>(std::stoul(byteStr, nullptr, 16));
-        }
-        catch (...)
-        {
-            // Unlike a bad memory read elsewhere in this file, std::stoul
-            // throwing here is a C++ exception, not a SEH access violation
-            // - __except can't catch it, and since this runs on the
-            // detached PipeServerThread with no outer try/catch, an
-            // uncaught one used to call std::terminate() and kill the
-            // whole game process outright, no recovery possible. The two
-            // stoull calls above (objHex/funcHex) were already guarded;
-            // this per-byte loop was the one gap.
-            return "ERROR could not parse parms_hex byte at offset " + std::to_string(i);
-        }
+        req->parms[i] = static_cast<uint8_t>(std::stoul(byteStr, nullptr, 16));
     }
 
     {
@@ -1290,46 +1139,6 @@ static bool IsCurrencyTypeChangedFunction(void* function)
     return isMatch;
 }
 
-// POD-only helpers (same C2712 reasoning as TryMatchPatternAt/
-// TryNullFirstParamPointer above - the capture functions below own a
-// std::lock_guard/std::vector::push_back, so the raw reads have to live
-// in their own destructor-free frame to be __try-able at all). Neither
-// CaptureCurrencyValueEvent nor CaptureCurrencyTypeEvent previously
-// null-checked params OR protected these offset reads - unlike every
-// other params/pointer read in this file. Currency HUD updates are
-// frequent and plausibly can fire right as a widget is torn down during
-// a transition, so this was a real gap.
-static bool TryReadCurrencyValueParams(void* params, int32_t& outNewValue, int32_t& outPreviousValue)
-{
-    if (!params)
-        return false;
-    __try
-    {
-        outNewValue = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(params) + 0x00);
-        outPreviousValue = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(params) + 0x04);
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-}
-
-static bool TryReadCurrencyTypeParams(void* params, uint32_t& outSerializedIdIndex)
-{
-    if (!params)
-        return false;
-    __try
-    {
-        outSerializedIdIndex = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(params) + 0x0C);
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-}
-
 static void CaptureCurrencyValueEvent(uint64_t widgetAddr, void* params)
 {
     // Params layout: two plain (non-out) int32 parms in declared order -
@@ -1337,8 +1146,8 @@ static void CaptureCurrencyValueEvent(uint64_t widgetAddr, void* params)
     // ProcessEvent params blob layout for two consecutive by-value int32s.
     CurrencyValueEvent evt;
     evt.widgetAddr = widgetAddr;
-    if (!TryReadCurrencyValueParams(params, evt.newValue, evt.previousValue))
-        return;
+    evt.newValue = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(params) + 0x00);
+    evt.previousValue = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(params) + 0x04);
 
     std::lock_guard<std::mutex> lock(g_currencyValueEventsMutex);
     g_currencyValueEvents.push_back(evt);
@@ -1354,8 +1163,7 @@ static void CaptureCurrencyTypeEvent(uint64_t widgetAddr, void* params)
     // elsewhere in this DLL and in dungeons_reader.py.
     CurrencyTypeEvent evt;
     evt.widgetAddr = widgetAddr;
-    if (!TryReadCurrencyTypeParams(params, evt.serializedIdIndex))
-        return;
+    evt.serializedIdIndex = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(params) + 0x0C);
 
     std::lock_guard<std::mutex> lock(g_currencyTypeEventsMutex);
     g_currencyTypeEvents.push_back(evt);
@@ -1440,20 +1248,6 @@ struct MissionOutcomeEvent
 static std::mutex g_missionOutcomeEventsMutex;
 static std::vector<MissionOutcomeEvent> g_missionOutcomeEvents;   // drained by the pipe thread via get_mission_outcome_events
 
-// Disable/re-enable state for the "silent hook" scheme - originally built
-// for zone transitions, now also reused to guard the early-startup crash
-// window (see SetupHookThread's tail): starts DISABLED (true) so the
-// ProcessEvent hook is created but never auto-enabled at boot; Python's
-// watch_zone_chests loop treats this identically to a transition-silence
-// and only calls reenable_hook once it sees a real zone AND a stable
-// item_stash address, which at cold start means "the game actually
-// finished loading" for free.
-// g_processEventHookTarget is filled in once, in SetupHookThread, right
-// after MH_CreateHook for ProcessEvent - kept separate from the currency
-// hook's target so disabling only affects ProcessEvent, not MH_ALL_HOOKS.
-static uintptr_t g_processEventHookTarget = 0;
-static std::atomic<bool> g_hookDisabledForTransition{true};
-
 static std::mutex g_missionOutcomeClassifyMutex;
 static std::unordered_set<void*> g_missionOutcomeFunctionPtrs;
 static std::unordered_set<void*> g_nonMissionOutcomeFunctionPtrs;
@@ -1515,73 +1309,6 @@ static void CaptureMissionOutcomeEvent(void* self, const std::string& triggerNam
     g_missionOutcomeEvents.push_back({ reinterpret_cast<uint64_t>(self), triggerName });
 }
 
-// ---- "no pion = silence" cutoff, extended to this hook's own per-object
-// classification work ----
-//
-// Mirrors dungeons_reader.py's get_pawn() chain (World -> GameInstance ->
-// LocalPlayers[0] -> PlayerController -> Pawn), done in-process so it's a
-// handful of direct pointer dereferences instead of pymem's cross-process
-// reads - cheap enough to call on every single ProcessEvent, the same way
-// get_pawn() itself is described elsewhere as "a handful of cheap pointer
-// reads." Wrapped in __try/__except like every other raw read in this file:
-// any bad pointer along the chain (GWorld itself mid-teardown during a
-// loading screen, an unset GameInstance before the first level loads, etc)
-// just resolves to "no pawn" instead of faulting.
-//
-// A null/failed result here means "no character is currently spawned" -
-// true both during loading screens/menus (the exact window this hook has
-// been linked to crashing in) AND for the brief instant right after
-// injection, before the game's own startup has even created a World yet.
-// hkProcessEvent_Impl uses this to skip the classification paths that
-// dereference `self` (TryGetClassName - the interact/pickup family, the
-// currency-widget cross-check, secret detection), since those are exactly
-// the per-object reads most likely to land on something mid-construction
-// during that window, and none of them have anything meaningful to do
-// without a live character anyway. Paths that only ever look at `function`
-// (IsDeathFunction, IsMissionOutcomeFunction) are deliberately NOT gated
-// here - once a function pointer is classified once, matching it again is
-// just a cached hash-set lookup with no per-object memory touched, so
-// gating those would only risk losing a real boss-kill or mission-outcome
-// event for no safety benefit.
-static bool TryGetLocalPawn(uint64_t& outPawn)
-{
-    __try
-    {
-        uintptr_t base = GetImageBase();
-        uint64_t world = *reinterpret_cast<uint64_t*>(base + Offsets::GWorld);
-        if (!world)
-            return false;
-
-        uint64_t gameInstance = *reinterpret_cast<uint64_t*>(world + Offsets::GameInstance);
-        if (!gameInstance)
-            return false;
-
-        uint64_t localPlayersData = *reinterpret_cast<uint64_t*>(gameInstance + Offsets::LocalPlayers);
-        int32_t localPlayersCount = *reinterpret_cast<int32_t*>(gameInstance + Offsets::LocalPlayers + 0x8);
-        if (!localPlayersData || localPlayersCount < 1)
-            return false;
-
-        uint64_t localPlayer = *reinterpret_cast<uint64_t*>(localPlayersData);
-        if (!localPlayer)
-            return false;
-
-        uint64_t playerController = *reinterpret_cast<uint64_t*>(localPlayer + Offsets::PlayerController);
-        if (!playerController)
-            return false;
-
-        uint64_t pawn = *reinterpret_cast<uint64_t*>(playerController + Offsets::Pawn);
-        if (!pawn)
-            return false;
-
-        outPawn = pawn;
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-}
-
 // hkProcessEvent itself is now a thin __try/__except wrapper (below) -
 // all the actual classification/detection logic that used to live directly
 // in hkProcessEvent was moved, unchanged, into this _Impl function. This is
@@ -1615,25 +1342,13 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
     if (callNum == 0)
         LogLine("hkProcessEvent: first call received - hook is definitely firing.");
 
-    // "No pion = silence" cutoff - see TryGetLocalPawn's own comment above
-    // for exactly what this does and doesn't gate. Computed once per call
-    // and reused below rather than re-walking the chain per classification
-    // block.
-    uint64_t localPawn = 0;
-    bool hasPawn = TryGetLocalPawn(localPawn);
-
     bool blocked = false;
 
-    // Simple block, no repool call: now that the "silent hook during
-    // transition" mechanism (mission-outcome detection -> MH_DisableHook
-    // -> Python's reenable_hook once zone+stash are confirmed stable)
-    // guards the transition-crash window directly, the manual
-    // TimeToPoolFinished() repool trick is no longer needed to work
-    // around it - and it had its own real cost (the item visibly
-    // vanishing instead of just being unclickable). Plain block: skip
-    // HandleInteraction entirely, item stays in the world, player just
-    // can't interact with it yet.
-    if (hasPawn && IsInteractFamilyFunction(function))
+    // Blocking check: broad match (whole Interact family, not just
+    // "OnInteracted") - the actual pickup effect can apply during the
+    // EARLIER "OnInteract" call, so only blocking "OnInteracted" let it
+    // through too late to matter. See IsInteractFamilyFunction's comment.
+    if (IsInteractFamilyFunction(function))
     {
         std::string className;
         if (TryGetClassName(self, className))
@@ -1686,11 +1401,8 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
     // dedup (originally added as a defensive safety net) is what makes
     // this safe to widen: OnInteracted can fire more than once per open,
     // but each actor address can only ever report once.
-    // Same hasPawn gate as the pickup-blocking check above - no chest can
-    // be genuinely opened without a spawned character, and both branches
-    // below eventually call TryGetClassName(self,...).
-    bool isNarrowChestReport = hasPawn && IsChestReportFunction(function);
-    bool isSupplyFallback = hasPawn && !isNarrowChestReport && IsInteractFamilyFunction(function);
+    bool isNarrowChestReport = IsChestReportFunction(function);
+    bool isSupplyFallback = !isNarrowChestReport && IsInteractFamilyFunction(function);
     if (!blocked && (isNarrowChestReport || isSupplyFallback))
     {
         std::string className;
@@ -1714,25 +1426,17 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
         }
     }
 
-    // NOT gated on hasPawn: IsDeathFunction only ever looks at `function`
-    // (cached after the first resolution) and CaptureDeathEvent doesn't
-    // touch `self`'s memory at all - no per-object read to protect here,
-    // and gating it would risk losing a real boss-kill event on exactly
-    // the tick a transient pawn-read miss coincided with one.
     if (IsDeathFunction(function))
         CaptureDeathEvent(self);
 
-    // Gated on hasPawn: CaptureSecretFoundEvent calls TryGetClassName(self,...).
-    if (hasPawn && IsSecretFoundFunction(function))
+    if (IsSecretFoundFunction(function))
         CaptureSecretFoundEvent(self);
 
     // Currency widget cross-check (see the block above g_currencyPtr's
     // section for why this exists). Gated on the INSTANCE's class name
     // containing "counter" - the function name alone ("OnValueChanged")
-    // is too generic to trust by itself game-wide. Also gated on hasPawn
-    // now: no currency HUD widget meaningfully exists without a spawned
-    // character, and this branch calls TryGetClassName(self,...) too.
-    if (hasPawn && (IsCurrencyValueChangedFunction(function) || IsCurrencyTypeChangedFunction(function)))
+    // is too generic to trust by itself game-wide.
+    if (IsCurrencyValueChangedFunction(function) || IsCurrencyTypeChangedFunction(function))
     {
         std::string className;
         if (TryGetClassName(self, className) &&
@@ -1746,35 +1450,10 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
         }
     }
 
-    // NOT gated on hasPawn, deliberately: same reasoning as death detection
-    // above - IsMissionOutcomeFunction only resolves `function`'s name
-    // (cached), and CaptureMissionOutcomeEvent only stores `self`'s raw
-    // address, no memory read on it. This is also the one event this hook
-    // can least afford to drop on a transient pawn-read miss: it can fire
-    // right as a totem-loss failure tears the character down, exactly the
-    // moment hasPawn would be least reliable.
     {
         std::string matchedTriggerName;
         if (IsMissionOutcomeFunction(function, matchedTriggerName))
-        {
             CaptureMissionOutcomeEvent(self, matchedTriggerName);
-
-            // Only act on the three EXACT trigger names (matchedTriggerName
-            // non-empty means exact match - see IsMissionOutcomeFunction),
-            // not the fuzzy "mission-outcome-like" heuristic - and only
-            // once per transition (compare_exchange guards against every
-            // Multicast replicating to several actors in one frame).
-            bool expected = false;
-            if (!matchedTriggerName.empty() && g_processEventHookTarget != 0 &&
-                g_hookDisabledForTransition.compare_exchange_strong(expected, true))
-            {
-                MH_STATUS st = MH_DisableHook(reinterpret_cast<void*>(g_processEventHookTarget));
-                LogLine("HOOK SILENT: ProcessEvent hook disabled for transition (trigger=" +
-                         matchedTriggerName + ", MH_DisableHook status=" +
-                         std::to_string(static_cast<int>(st)) +
-                         ") - waiting for reenable_hook from the Python side.");
-            }
-        }
     }
 
     if (!blocked)
@@ -1862,41 +1541,26 @@ void hkProcessEvent(void* self, void* function, void* params)
 // returns int in EAX, a normal C function with this signature is ABI-
 // compatible as a drop-in replacement - no hand-assembled bytes needed.
 
-static void* g_currencyPtr = nullptr;
-
-typedef int(*CurrencyGetterFn)(void* thisPtr);
-static CurrencyGetterFn oCurrencyGetter = nullptr;
-
-int hkCurrencyGetter(void* thisPtr)
-{
-    // Always track the LATEST thisPtr the game itself calls this getter
-    // with - NOT just the first one ever seen. This getter is called
-    // constantly by the game's own UI/logic, always with whatever the
-    // CURRENT live currency object is. A "capture once, keep forever"
-    // guard (the previous `if (!g_currencyPtr)` here) means that if the
-    // underlying currency component is ever destroyed and recreated -
-    // a hero swap, a save reload, the same class of zone-transition
-    // churn already documented around apply_emerald_reward's own
-    // staleness handling on the Python side - g_currencyPtr stays
-    // permanently pinned to the OLD, now-stale/freed pointer, and every
-    // later call (which DOES have the correct new pointer) gets
-    // silently ignored. Confirmed happening live: a long-running
-    // Dungeons.exe process (same PID across multiple client sessions)
-    // ended up handing back a wildly garbage read (-1558079228) through
-    // the stale pointer, and every subsequent write via that same
-    // pointer "verified" successfully against ITSELF (read-back matched
-    // what was just written) while never touching the real, live
-    // currency object at all - so the in-game HUD never moved despite
-    // every grant reporting success. Unconditionally re-assigning here
-    // keeps g_currencyPtr self-healing: it converges back onto the real
-    // live object within one native getter call after the game itself
-    // next needs to display/use the currency (essentially immediately -
-    // this getter is called far more often than dungeons_reader.py
-    // polls), rather than requiring the whole DLL (and therefore the
-    // whole game process) to restart to recover.
-    g_currencyPtr = thisPtr;
-    return oCurrencyGetter(thisPtr);
-}
+// ---- hkCurrencyGetter / g_currencyPtr: PERMANENTLY REMOVED ----
+// AVOID this hook (it was "branch 0" in the branch-by-branch crash
+// isolation test) - it is the CONFIRMED cause of the recurring
+// Dungeons.exe crash (PCallStackHash A3D4B2C4B9A67CD3F78D1BBF39B8F686BCA73B30,
+// ~70s into a session, 100% engine frames, zero dungeons_bridge frames).
+// Isolation test results:
+//   branch 0 (currency hook ALONE)                 -> CRASH
+//   branch 7 (nothing hooked at all)                -> no crash
+//   branch 1 (ProcessEvent hooked, no classification) -> no crash
+//   branch 8 (everything EXCEPT the currency hook)   -> no crash
+// Branch 0 crashing alone + its exact inverse not crashing = necessary and
+// sufficient. Do NOT re-add this hook or its AOB pattern scan.
+//
+// Nothing in the live client needs it: apply_emerald_reward grants via the
+// real UWalletComponent::ClientAdd UFunction and read_current_emeralds is a
+// plain memory read - neither ever touched g_currencyPtr. Only dev-only CLI
+// tooling in dungeons_reader.py (scan_currency/dump_currency and friends)
+// used get_currency_ptr; it now returns a "REMOVED:..." sentinel below.
+// For currency tracking use get_currency_value_events /
+// get_currency_type_events (the currency-widget ProcessEvent cross-check).
 
 // Simple AOB scan across the main module's mapped image (reads size from
 // its own PE header - no extra library dependency needed). Returns EVERY
@@ -1981,9 +1645,12 @@ std::string HandleRequest(const std::string& request)
 {
     if (request == "get_currency_ptr")
     {
-        std::ostringstream out;
-        out << "PTR:" << std::hex << reinterpret_cast<uintptr_t>(g_currencyPtr);
-        return out.str();
+        // hkCurrencyGetter/g_currencyPtr permanently removed - confirmed
+        // crash cause (see the AVOID note where hkCurrencyGetter used to be
+        // defined). A clear sentinel instead of a stale/null "PTR:0" so any
+        // Python-side caller fails loudly instead of reading garbage.
+        return "REMOVED:native currency getter hook permanently removed - confirmed "
+               "crash cause; use get_currency_value_events/get_currency_type_events instead";
     }
 
     if (request == "get_currency_value_events")
@@ -2110,29 +1777,6 @@ std::string HandleRequest(const std::string& request)
         return out.str();
     }
 
-    // Companion commands to the "silent hook during transition" scheme
-    // (see the compare_exchange in hkProcessEvent_Impl's mission-outcome
-    // block). This handler runs on the pipe server's own thread, not the
-    // game thread - it works fine even while the ProcessEvent hook itself
-    // is disabled, since disabling it doesn't touch this thread at all.
-    if (request == "get_hook_status")
-        return g_hookDisabledForTransition.load(std::memory_order_relaxed) ? "DISABLED" : "ENABLED";
-
-    if (request == "reenable_hook")
-    {
-        bool expected = true;
-        if (!g_hookDisabledForTransition.compare_exchange_strong(expected, false))
-            return "OK (was already enabled)";
-
-        if (g_processEventHookTarget == 0)
-            return "ERROR: hook target never recorded";
-
-        MH_STATUS st = MH_EnableHook(reinterpret_cast<void*>(g_processEventHookTarget));
-        LogLine("HOOK REACTIVATED: ProcessEvent hook re-enabled (MH_EnableHook status=" +
-                 std::to_string(static_cast<int>(st)) + ")");
-        return st == MH_OK ? "OK" : "ERROR: MH_EnableHook status " + std::to_string(static_cast<int>(st));
-    }
-
     if (request.rfind("CALL ", 0) == 0)
         return HandleCall(request.substr(5));
 
@@ -2199,34 +1843,7 @@ void PipeServerThread()
                 buffer[bytesRead] = '\0';
                 std::string request(buffer);
 
-                // Top-level safety net, on top of (not instead of) fixing
-                // gaps at the source like the parmsHex loop above: any C++
-                // exception anywhere in HandleRequest's call chain that
-                // slips past every individual try/catch would otherwise
-                // propagate all the way up here uncaught and call
-                // std::terminate() on this detached thread, killing the
-                // whole game process with no recovery. This can't catch a
-                // genuine SEH access violation (that needs __except, at
-                // the actual read site - see TryGetLocalPawn etc.), only
-                // C++ exceptions, but it's a real second line of defense
-                // for anything a future change misses.
-                std::string response;
-                try
-                {
-                    response = HandleRequest(request);
-                }
-                catch (const std::exception& e)
-                {
-                    LogLine(std::string("PipeServerThread: caught an unhandled C++ exception from "
-                             "HandleRequest (would have killed the whole process otherwise): ") + e.what());
-                    response = std::string("ERROR: unhandled exception: ") + e.what();
-                }
-                catch (...)
-                {
-                    LogLine("PipeServerThread: caught an unknown unhandled exception from HandleRequest "
-                             "(would have killed the whole process otherwise).");
-                    response = "ERROR: unknown unhandled exception";
-                }
+                std::string response = HandleRequest(request);
 
                 DWORD bytesWritten = 0;
                 WriteFile(pipe, response.c_str(), (DWORD)response.size(), &bytesWritten, nullptr);
@@ -2274,52 +1891,11 @@ void SetupHookThread()
     if (initStatus != MH_OK)
         return;
 
-    const uint8_t currencyPattern[] = { 0xF8, 0x8B, 0x41, 0x08, 0xC3, 0xCC };
-    // A live cross-check (real HUD: Emeralds=258, Gold=0, Eyes of Ender=801
-    // vs the currency object this hook was capturing: only Eyes of Ender's
-    // value found ANYWHERE within 0x200 bytes of it) proved this 6-byte
-    // pattern is too generic to trust FindPattern's old first-match-only
-    // behavior for - `mov eax,[rcx+8]; ret` is the compiled shape of any
-    // trivial int32 getter, not something unique to a shared multi-
-    // currency wallet object. Logging every match (not just the first) so
-    // the next debugging round has hard data instead of another guess:
-    // if there are several matches, the real wallet getter - if the game
-    // even has ONE getter shared across all 3 currencies rather than a
-    // separate object/getter per currency type - is presumably among
-    // them, and each one's captured pointer can be checked with
-    // dungeons_reader.py's scan_currency the same way this one just was.
-    std::vector<uintptr_t> currencyMatches = FindAllPatterns(currencyPattern, sizeof(currencyPattern));
-    LogLine("Currency pattern occurrences found in image: " + std::to_string(currencyMatches.size()));
-    for (size_t i = 0; i < currencyMatches.size() && i < 16; ++i)
-    {
-        uintptr_t rva = currencyMatches[i] - GetImageBase();
-        LogLine("  candidate[" + std::to_string(i) + "] @ image+0x" +
-                [&]{ std::ostringstream oss; oss << std::hex << rva; return oss.str(); }());
-    }
-    uintptr_t found = currencyMatches.empty() ? 0 : currencyMatches[0];
-    if (found)
-    {
-        uintptr_t hookTarget = found + 1; // skip the leading 0xF8, hook at the actual
-                                           // `mov eax,[rcx+8]` body
-        MH_STATUS currencyStatus = MH_CreateHook(reinterpret_cast<void*>(hookTarget), &hkCurrencyGetter,
-                      reinterpret_cast<void**>(&oCurrencyGetter));
-        LogLine("Currency hook MH_CreateHook status: " + std::to_string(static_cast<int>(currencyStatus)) +
-                " (hooked candidate[0] - see the count above; if scan_currency still can't find "
-                "Emeralds/Gold nearby, the real getter is probably one of the OTHER candidates "
-                "logged above, not this one)");
-        if (currencyStatus == MH_OK)
-        {
-            // Enabled immediately (unlike ProcessEvent below) - the currency
-            // getter isn't implicated in the startup-crash window, only
-            // read via a simple int32 return, no GObjects/zone-teardown risk.
-            MH_STATUS currencyEnableStatus = MH_EnableHook(reinterpret_cast<void*>(hookTarget));
-            LogLine("Currency hook MH_EnableHook status: " + std::to_string(static_cast<int>(currencyEnableStatus)));
-        }
-    }
-    else
-    {
-        LogLine("Currency pattern not found in image");
-    }
+    // AVOID: the native currency-getter hook (AOB pattern scan + MH_CreateHook
+    // on hkCurrencyGetter) used to be installed right here. It has been
+    // PERMANENTLY REMOVED - it is the confirmed crash cause (see the note
+    // where hkCurrencyGetter used to be defined). Do not reinstall it.
+    LogLine("Currency getter hook: permanently removed from this build (confirmed crash cause) - not installed.");
 
     // ProcessEvent hook for chest-open detection. Same RVA GetProcessEventFn()
     // already uses for the CALL/CALLDATA path - after this hook is installed,
@@ -2327,21 +1903,13 @@ void SetupHookThread()
     // just forwards to oProcessEvent when it's not an OnOpenLootChest call),
     // so nothing about the existing CALL functionality changes.
     uintptr_t peAddr = GetImageBase() + Offsets::ProcessEvent;
-    g_processEventHookTarget = peAddr;
     LogLine("ProcessEvent target address: 0x" + [&]{ std::ostringstream o; o << std::hex << peAddr; return o.str(); }());
     MH_STATUS peStatus = MH_CreateHook(reinterpret_cast<void*>(peAddr),
-                  &hkProcessEvent, reinterpret_cast<void**>(&oProcessEvent));
+                  reinterpret_cast<void*>(&hkProcessEvent), reinterpret_cast<void**>(&oProcessEvent));
     LogLine("ProcessEvent hook MH_CreateHook status: " + std::to_string(static_cast<int>(peStatus)));
 
-    // Deliberately NOT enabled here - see g_hookDisabledForTransition's
-    // comment above. MH_CreateHook leaves a hook created-but-disabled
-    // until MH_EnableHook is called on it; by never calling that for
-    // peAddr, the hook stays inert (oProcessEvent behaves as if we were
-    // never here) until watch_zone_chests' loop confirms the game is
-    // actually stable and sends reenable_hook.
-    LogLine("HOOK SILENT: ProcessEvent hook created but not enabled at startup "
-            "(target=0x" + [&]{ std::ostringstream o; o << std::hex << peAddr; return o.str(); }() +
-            ") - waiting for reenable_hook once the game is confirmed stable.");
+    MH_STATUS enableStatus = MH_EnableHook(MH_ALL_HOOKS);
+    LogLine("MH_EnableHook(MH_ALL_HOOKS) status: " + std::to_string(static_cast<int>(enableStatus)));
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
