@@ -315,12 +315,20 @@ static std::atomic<bool>      g_nullWorldGaveUp{ false };
 // change can clear it: UObject addresses are reused across levels, and a
 // stale entry would make a NEW station at the same address never report.
 static std::mutex g_reportedSupplyActorsMutex;
-static std::unordered_set<uint64_t> g_reportedSupplyActors;
+
+// Built lazily on first use (function-local static), exactly like the original
+// function-local set inside hkProcessEvent_Impl: nothing is allocated at DLL
+// load time, so DLL_PROCESS_ATTACH stays identical to the pre-patch build.
+static std::unordered_set<uint64_t>& ReportedSupplyActors()
+{
+    static std::unordered_set<uint64_t> s;
+    return s;
+}
 
 static void ClearSupplyDedupe()
 {
     std::lock_guard<std::mutex> lock(g_reportedSupplyActorsMutex);
-    g_reportedSupplyActors.clear();
+    ReportedSupplyActors().clear();
 }
 
 // Cancels everything queued for the game thread (defined after the queues).
@@ -358,7 +366,7 @@ static void FlushSilenceLog()
 
 // Returns true while the hook must stay silent. Safe from any thread; only the
 // hook thread normally drives it, pipe handlers call it read-mostly.
-static bool EvaluateSilence()
+static bool EvaluateSilencePatched()
 {
     const ULONGLONG now = GetTickCount64();
     const uint64_t world = GetCurrentWorldPtr();
@@ -441,6 +449,87 @@ static bool EvaluateSilence()
         return false;
     }
     return true;
+}
+
+// ---- Launch-parity guard --------------------------------------------------
+// Until the hook has gone ACTIVE ONCE in this session (i.e. the whole game
+// start-up window), EvaluateSilence() runs the ORIGINAL pre-patch state
+// machine below, byte-for-byte in behaviour (30 s deadman, direct logging, no
+// purge / dedupe-clear side effects). That is the build that is known not to
+// crash at launch. Everything the safety patch adds (null-world cap, purge of
+// stale queued work on world change, deferred log queue, ...) only takes over
+// AFTER the first activation, i.e. for level transitions during play.
+static std::atomic<bool> g_everActive{ false };
+
+static void SilenceLogDirect(const char* what, uint64_t world, ULONGLONG ms)
+{
+    std::ostringstream o;
+    o << "HOOK " << what << " (world=0x" << std::hex << world << std::dec << ", " << ms << " ms)";
+    LogLine(o.str());
+}
+
+static bool EvaluateSilenceLegacy()
+{
+    const ULONGLONG now = GetTickCount64();
+    const uint64_t world = GetCurrentWorldPtr();
+    const uint64_t prevWorld = g_lastSeenWorld.exchange(world, std::memory_order_relaxed);
+    bool silent = g_hookSilent.load(std::memory_order_relaxed);
+
+    if (silent && now - g_silentSince.load(std::memory_order_relaxed) >= SILENCE_MAX_MS)
+    {
+        g_hookSilent.store(false, std::memory_order_relaxed);
+        g_lastWorldChange.store(now, std::memory_order_relaxed);
+        SilenceLogDirect("ACTIVE: deadman cap reached", world, now - g_silentSince.load(std::memory_order_relaxed));
+        return false;
+    }
+
+    if (world != prevWorld)
+    {
+        g_lastWorldChange.store(now, std::memory_order_relaxed);
+        if (!silent)
+        {
+            g_silentSince.store(now, std::memory_order_relaxed);
+            g_hookSilent.store(true, std::memory_order_relaxed);
+            SilenceLogDirect("SILENT: world changed", world, 0);
+        }
+        return true;
+    }
+
+    if (now < g_forceSilentUntil.load(std::memory_order_relaxed))
+    {
+        if (!silent)
+        {
+            g_silentSince.store(now, std::memory_order_relaxed);
+            g_hookSilent.store(true, std::memory_order_relaxed);
+            SilenceLogDirect("SILENT: forced by hook_silence", world, 0);
+        }
+        return true;
+    }
+
+    if (!silent)
+        return false;
+
+    const ULONGLONG since = g_silentSince.load(std::memory_order_relaxed);
+    const ULONGLONG lastChange = g_lastWorldChange.load(std::memory_order_relaxed);
+    if (world != 0 && now - lastChange >= SILENCE_SETTLE_MS)
+    {
+        g_hookSilent.store(false, std::memory_order_relaxed);
+        SilenceLogDirect("ACTIVE: world stable", world, now - since);
+        return false;
+    }
+    return true;
+}
+
+static bool EvaluateSilence()
+{
+    if (!g_everActive.load(std::memory_order_relaxed))
+    {
+        const bool silent = EvaluateSilenceLegacy();
+        if (!silent)
+            g_everActive.store(true, std::memory_order_relaxed);   // from now on: patched logic
+        return silent;
+    }
+    return EvaluateSilencePatched();
 }
 
 static void InitSilenceAtInstall()
@@ -1192,7 +1281,11 @@ static std::vector<InteractEvent> g_interactEvents;   // drained by the pipe thr
 // resolved, or after NAME_FAIL_LIMIT failed attempts on the same pointer
 // (so a truly unresolvable one still stops costing a resolve per call).
 static std::mutex g_nameFailMutex;
-static std::unordered_map<void*, int> g_nameFailCounts;
+static std::unordered_map<void*, int>& NameFailCounts()   // lazy: nothing allocated at DLL load
+{
+    static std::unordered_map<void*, int> m;
+    return m;
+}
 static const int NAME_FAIL_LIMIT = 8;
 
 static bool ShouldCacheNegative(void* function, bool nameResolved)
@@ -1200,7 +1293,7 @@ static bool ShouldCacheNegative(void* function, bool nameResolved)
     if (nameResolved)
         return true;
     std::lock_guard<std::mutex> lock(g_nameFailMutex);
-    return ++g_nameFailCounts[function] >= NAME_FAIL_LIMIT;
+    return ++NameFailCounts()[function] >= NAME_FAIL_LIMIT;
 }
 
 static std::mutex g_interactFamilyClassifyMutex;
@@ -1843,7 +1936,7 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
                 bool alreadyReported;
                 {
                     std::lock_guard<std::mutex> lock(g_reportedSupplyActorsMutex);
-                    alreadyReported = !g_reportedSupplyActors.insert(addr).second;
+                    alreadyReported = !ReportedSupplyActors().insert(addr).second;
                 }
                 if (!alreadyReported)
                     CaptureInteractEvent(addr, className);
@@ -2358,9 +2451,42 @@ void PipeServerThread()
 // found" in this tester's own log - Present was never reliably available
 // to begin with, on top of being a suspected crash cause).
 
+// Breadcrumb thread (compile out with -DBRIDGE_WORLD_WATCH=0): READS GWorld and
+// the silence flag every 250 ms and logs each change from ITS OWN thread, so a
+// crash timeline exists without any file I/O on the game thread. It never calls
+// EvaluateSilence() and never writes any shared state.
+#ifndef BRIDGE_WORLD_WATCH
+#define BRIDGE_WORLD_WATCH 1
+#endif
+#if BRIDGE_WORLD_WATCH
+static void WorldWatchThread()
+{
+    uint64_t lastWorld = ~0ull;
+    int lastSilent = -1;
+    int lines = 0;
+    for (;;)
+    {
+        const uint64_t w = GetCurrentWorldPtr();
+        const int sil = g_hookSilent.load(std::memory_order_relaxed) ? 1 : 0;
+        if ((w != lastWorld || sil != lastSilent) && lines < 400)
+        {
+            std::ostringstream o;
+            o << "WATCH tick=" << GetTickCount64() << " GWorld=0x" << std::hex << w << std::dec
+              << " hook=" << (sil ? "silent" : "active");
+            LogLine(o.str());
+            ++lines;
+            lastWorld = w;
+            lastSilent = sil;
+        }
+        Sleep(250);
+    }
+}
+#endif
+
 void SetupHookThread()
 {
     LogLine("=== SetupHookThread starting (new session) ===");
+    LogLine("BUILD: silence + safety patch, launch-parity guard v1 (original start-up logic until the first ACTIVE)");
     // Small delay so classification/hooking doesn't start before the game's
     // own early init has had a chance to settle.
     Sleep(3000);
@@ -2401,6 +2527,9 @@ void SetupHookThread()
 
     MH_STATUS enableStatus = MH_EnableHook(MH_ALL_HOOKS);
     LogLine("MH_EnableHook(MH_ALL_HOOKS) status: " + std::to_string(static_cast<int>(enableStatus)));
+#if BRIDGE_WORLD_WATCH
+    std::thread(WorldWatchThread).detach();
+#endif
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
