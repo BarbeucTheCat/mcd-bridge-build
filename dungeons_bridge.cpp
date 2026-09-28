@@ -41,6 +41,7 @@
 #include <vector>
 #include <set>
 #include <unordered_set>
+#include <unordered_map>
 #include <algorithm>
 #include <cctype>
 #include <memory>
@@ -207,14 +208,15 @@ static const StoreOffsets kOffsetsMsStore = {
 // 0x01246E10: derived from an older Steam session's log ("ProcessEvent target
 // address 0x7ff7276a6e10") and the crash dump of that same process (image
 // base ...26460000) - cross-checked, but not read from a Steam Dumper-7 dump.
-// appendString: NOT KNOWN for the Steam build yet - left at 0 on purpose
-// rather than guessed. With 0, name resolution is disabled on Steam (the hook
-// still forwards calls and drains queued item grants, but nothing that needs
-// a name - pickup blocking, chest/boss/secret detection - can run) instead of
-// calling a wrong address. Fill in OFFSET_APPENDSTRING from the Steam dump.
+// appendString 0x010C19A0: Offsets::AppendString from the Steam Dumper-7
+// Basic.hpp. That same dump also confirms gobjects 0x04696848, gworld
+// 0x04795230 and processEvent 0x01246E10 (so the ProcessEvent RVA is no
+// longer just "derived from a log"). If AppendString were ever 0 again, name
+// resolution would be disabled (nothing that needs a name can run) instead
+// of calling a wrong address.
 static const StoreOffsets kOffsetsSteam = {
     "steam (Dungeons-Win64-Shipping.exe)",
-    0x04696848, 0 /* appendString: unknown */, 0x01246E10, 0x04795230 };
+    0x04696848, 0x010C19A0, 0x01246E10, 0x04795230 };
 
 static std::once_flag g_offsetsOnce;
 
@@ -288,20 +290,70 @@ static uint64_t GetCurrentWorldPtr()
 // Silence starts (a) at hook install, (b) whenever GWorld changes or goes
 // null (level transition), (c) on the optional hook_silence <ms> command.
 static const ULONGLONG SILENCE_SETTLE_MS = 4000;    // world must sit still this long
-static const ULONGLONG SILENCE_MAX_MS    = 30000;   // absolute cap per silent window
+static const ULONGLONG SILENCE_MAX_MS    = 30000;   // absolute cap per silent window (world non-null)
 static const ULONGLONG SILENCE_FORCE_MAX = 30000;   // cap on hook_silence <ms>
+// GWorld == 0 means the engine is still booting (or a world is being torn
+// down). Cold start of the game can take well over SILENCE_MAX_MS, and going
+// ACTIVE mid engine-init is exactly the startup risk this silence exists to
+// avoid, so a NULL world gets a much longer cap. It still fails open in the
+// end (e.g. a stale GWorld offset after a game update must not leave the
+// hook silent forever) and then stays open until a non-null world is seen.
+static const ULONGLONG SILENCE_MAX_NULLWORLD_MS = 180000;
+// Queued CALL/CALLDATA/generic work older than this, or enqueued under a
+// different GWorld than the current one, is cancelled instead of executed
+// (its object pointers belong to a world that no longer exists).
+static const ULONGLONG PENDING_WORK_MAX_AGE_MS = 5000;
 
 static std::atomic<bool>      g_hookSilent{ true };
 static std::atomic<ULONGLONG> g_silentSince{ 0 };
 static std::atomic<ULONGLONG> g_lastWorldChange{ 0 };
 static std::atomic<uint64_t>  g_lastSeenWorld{ 0 };
 static std::atomic<ULONGLONG> g_forceSilentUntil{ 0 };
+static std::atomic<bool>      g_nullWorldGaveUp{ false };
+
+// Supply Station report dedupe (by actor address). File scope so a world
+// change can clear it: UObject addresses are reused across levels, and a
+// stale entry would make a NEW station at the same address never report.
+static std::mutex g_reportedSupplyActorsMutex;
+static std::unordered_set<uint64_t> g_reportedSupplyActors;
+
+static void ClearSupplyDedupe()
+{
+    std::lock_guard<std::mutex> lock(g_reportedSupplyActorsMutex);
+    g_reportedSupplyActors.clear();
+}
+
+// Cancels everything queued for the game thread (defined after the queues).
+static void PurgePendingWork(const char* why);
+
+// Log lines produced by the silence state machine are only QUEUED here and
+// written later (FlushSilenceLog) from an already-active hook call or from
+// the pipe thread - no file I/O on the game thread in the middle of a level
+// transition.
+static std::mutex g_silenceLogMutex;
+static std::vector<std::string> g_silenceLogQueue;
 
 static void SilenceLog(const char* what, uint64_t world, ULONGLONG ms)
 {
     std::ostringstream o;
-    o << "HOOK " << what << " (world=0x" << std::hex << world << std::dec << ", " << ms << " ms)";
-    LogLine(o.str());
+    o << "HOOK " << what << " (world=0x" << std::hex << world << std::dec << ", " << ms
+      << " ms, tick=" << GetTickCount64() << ")";
+    std::lock_guard<std::mutex> lock(g_silenceLogMutex);
+    if (g_silenceLogQueue.size() < 64)
+        g_silenceLogQueue.push_back(o.str());
+}
+
+static void FlushSilenceLog()
+{
+    std::vector<std::string> local;
+    {
+        std::lock_guard<std::mutex> lock(g_silenceLogMutex);
+        if (g_silenceLogQueue.empty())
+            return;
+        local.swap(g_silenceLogQueue);
+    }
+    for (const auto& line : local)
+        LogLine(line);
 }
 
 // Returns true while the hook must stay silent. Safe from any thread; only the
@@ -311,21 +363,37 @@ static bool EvaluateSilence()
     const ULONGLONG now = GetTickCount64();
     const uint64_t world = GetCurrentWorldPtr();
     const uint64_t prevWorld = g_lastSeenWorld.exchange(world, std::memory_order_relaxed);
+    const bool nullWorld = (world == 0);
+    if (!nullWorld)
+        g_nullWorldGaveUp.store(false, std::memory_order_relaxed);
     bool silent = g_hookSilent.load(std::memory_order_relaxed);
 
-    // Deadman first: a silent window can never outlive SILENCE_MAX_MS, even if
-    // the world pointer keeps changing the whole time.
-    if (silent && now - g_silentSince.load(std::memory_order_relaxed) >= SILENCE_MAX_MS)
+    // Null -> non-null: the engine just created its first world. The silent
+    // time spent so far (possibly minutes of engine boot) must not count
+    // against the normal cap, or the deadman below would fire immediately and
+    // skip the settle period this silence exists for.
+    if (silent && prevWorld == 0 && world != 0)
+        g_silentSince.store(now, std::memory_order_relaxed);
+
+    // Deadman first: a silent window can never outlive its cap, even if the
+    // world pointer keeps changing the whole time.
+    const ULONGLONG cap = nullWorld ? SILENCE_MAX_NULLWORLD_MS : SILENCE_MAX_MS;
+    if (silent && now - g_silentSince.load(std::memory_order_relaxed) >= cap)
     {
         g_hookSilent.store(false, std::memory_order_relaxed);
         g_lastWorldChange.store(now, std::memory_order_relaxed);
-        SilenceLog("ACTIVE: deadman cap reached", world, now - g_silentSince.load(std::memory_order_relaxed));
+        if (nullWorld)
+            g_nullWorldGaveUp.store(true, std::memory_order_relaxed);
+        SilenceLog(nullWorld ? "ACTIVE: deadman cap reached (GWorld still null)" : "ACTIVE: deadman cap reached",
+                   world, now - g_silentSince.load(std::memory_order_relaxed));
         return false;
     }
 
     if (world != prevWorld)                       // level transition begins / continues
     {
         g_lastWorldChange.store(now, std::memory_order_relaxed);
+        ClearSupplyDedupe();
+        PurgePendingWork("world changed");
         if (!silent)
         {
             g_silentSince.store(now, std::memory_order_relaxed);
@@ -341,7 +409,22 @@ static bool EvaluateSilence()
         {
             g_silentSince.store(now, std::memory_order_relaxed);
             g_hookSilent.store(true, std::memory_order_relaxed);
+            PurgePendingWork("hook_silence");
             SilenceLog("SILENT: forced by hook_silence", world, 0);
+        }
+        return true;
+    }
+
+    // NULL world (engine booting / world torn down): stay silent, up to the
+    // long null-world cap handled above.
+    if (nullWorld && !g_nullWorldGaveUp.load(std::memory_order_relaxed))
+    {
+        if (!silent)
+        {
+            g_silentSince.store(now, std::memory_order_relaxed);
+            g_hookSilent.store(true, std::memory_order_relaxed);
+            PurgePendingWork("GWorld null");
+            SilenceLog("SILENT: GWorld null", world, 0);
         }
         return true;
     }
@@ -367,6 +450,7 @@ static void InitSilenceAtInstall()
     g_lastWorldChange.store(now, std::memory_order_relaxed);
     g_silentSince.store(now, std::memory_order_relaxed);
     g_forceSilentUntil.store(0, std::memory_order_relaxed);
+    g_nullWorldGaveUp.store(false, std::memory_order_relaxed);
     g_hookSilent.store(true, std::memory_order_relaxed);
 }
 
@@ -580,7 +664,14 @@ std::string HandleResolveName(const std::string& hexIndex)
 // loop turned out to need this too, same root cause as ProcessEvent did) ----
 
 static std::mutex g_genericQueueMutex;
-static std::queue<std::function<void()>> g_pendingGenericWork;
+struct GenericJob
+{
+    std::function<void()> run;
+    std::function<void()> cancel;   // wakes the waiting pipe thread without running the work
+    ULONGLONG enqueuedAt = 0;
+    uint64_t world = 0;             // GWorld when enqueued
+};
+static std::queue<GenericJob> g_pendingGenericWork;
 
 static void QueueAndWaitForRenderThread(const std::function<void()>& work)
 {
@@ -598,9 +689,23 @@ static void QueueAndWaitForRenderThread(const std::function<void()>& work)
         localCv->notify_all();
     };
 
+    std::function<void()> cancelFn = [localMutex, localCv, done]()
+    {
+        {
+            std::lock_guard<std::mutex> lock(*localMutex);
+            *done = true;
+        }
+        localCv->notify_all();
+    };
+
     {
         std::lock_guard<std::mutex> lock(g_genericQueueMutex);
-        g_pendingGenericWork.push(wrapped);
+        GenericJob job;
+        job.run = wrapped;
+        job.cancel = cancelFn;
+        job.enqueuedAt = GetTickCount64();
+        job.world = GetCurrentWorldPtr();
+        g_pendingGenericWork.push(job);
     }
 
     std::unique_lock<std::mutex> lock(*localMutex);
@@ -609,15 +714,27 @@ static void QueueAndWaitForRenderThread(const std::function<void()>& work)
 
 static void DrainGenericWork()
 {
-    std::queue<std::function<void()>> localQueue;
+    std::queue<GenericJob> localQueue;
     {
         std::lock_guard<std::mutex> lock(g_genericQueueMutex);
         std::swap(localQueue, g_pendingGenericWork);
     }
     while (!localQueue.empty())
     {
-        localQueue.front()();
+        GenericJob job = localQueue.front();
         localQueue.pop();
+        // Stale work (older than the caller's own wait, or queued under a
+        // different world) is cancelled, never executed against dead pointers.
+        const bool stale = (GetTickCount64() - job.enqueuedAt > PENDING_WORK_MAX_AGE_MS) ||
+                           (job.world != GetCurrentWorldPtr());
+        if (stale)
+        {
+            if (job.cancel) job.cancel();
+        }
+        else if (job.run)
+        {
+            job.run();
+        }
     }
 }
 
@@ -739,7 +856,12 @@ struct CallRequest
     bool done = false;
     bool faulted = false;
     DWORD exceptionCode = 0;
+    bool cancelled = false;         // pipe thread gave up waiting (timeout) - never execute it afterwards
+    ULONGLONG enqueuedAt = 0;
+    uint64_t world = 0;             // GWorld when enqueued
 };
+
+static const DWORD kCallCancelledCode = 0xE0000002;   // private: cancelled / stale, never executed
 
 static std::mutex g_queueMutex;
 static std::queue<std::shared_ptr<CallRequest>> g_pendingCalls;
@@ -789,6 +911,32 @@ static void DrainPendingCalls()
         auto req = localQueue.front();
         localQueue.pop();
 
+        // Never execute a request whose caller already gave up, that sat too
+        // long, or that was queued under a previous world: its object
+        // pointers may be dead or reused.
+        bool stale;
+        {
+            std::lock_guard<std::mutex> lock(g_resultMutex);
+            stale = req->cancelled || req->done;
+        }
+        if (!stale)
+            stale = (GetTickCount64() - req->enqueuedAt > PENDING_WORK_MAX_AGE_MS) ||
+                    (req->world != GetCurrentWorldPtr());
+        if (stale)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_resultMutex);
+                if (!req->done)
+                {
+                    req->done = true;
+                    req->faulted = true;
+                    req->exceptionCode = kCallCancelledCode;
+                }
+            }
+            g_resultCv.notify_all();
+            continue;
+        }
+
         DWORD exceptionCode = 0;
         bool ok = TryProcessEventCall(req->objectAddr, req->functionAddr, req->parms.data(), exceptionCode);
 
@@ -799,6 +947,45 @@ static void DrainPendingCalls()
             req->exceptionCode = exceptionCode;
         }
         g_resultCv.notify_all();
+    }
+}
+
+static void PurgePendingWork(const char* /*why*/)
+{
+    std::queue<std::shared_ptr<CallRequest>> calls;
+    {
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        std::swap(calls, g_pendingCalls);
+    }
+    if (!calls.empty())
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_resultMutex);
+            while (!calls.empty())
+            {
+                auto r = calls.front();
+                calls.pop();
+                if (!r->done)
+                {
+                    r->done = true;
+                    r->faulted = true;
+                    r->exceptionCode = kCallCancelledCode;
+                }
+            }
+        }
+        g_resultCv.notify_all();
+    }
+
+    std::queue<GenericJob> jobs;
+    {
+        std::lock_guard<std::mutex> lock(g_genericQueueMutex);
+        std::swap(jobs, g_pendingGenericWork);
+    }
+    while (!jobs.empty())
+    {
+        if (jobs.front().cancel)
+            jobs.front().cancel();
+        jobs.pop();
     }
 }
 
@@ -833,6 +1020,8 @@ std::string HandleCall(const std::string& args)
     req->functionAddr = functionAddr;
     req->parmsSize = parmsSize;
     req->parms.resize(parmsSize, 0);
+    req->enqueuedAt = GetTickCount64();
+    req->world = GetCurrentWorldPtr();
 
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
@@ -843,7 +1032,13 @@ std::string HandleCall(const std::string& args)
     bool serviced = g_resultCv.wait_for(lock, std::chrono::seconds(5), [&] { return req->done; });
 
     if (!serviced)
+    {
+        req->cancelled = true;   // g_resultMutex is held here (wait_for returned) - Drain will skip it
         return "ERROR timed out waiting for render thread (is the game minimized/frozen?)";
+    }
+
+    if (req->faulted && req->exceptionCode == kCallCancelledCode)
+        return "ERROR:cancelled (hook silent / world changed) - retry shortly";
 
     if (req->faulted)
     {
@@ -904,6 +1099,8 @@ std::string HandleCallData(const std::string& args)
         std::string byteStr = parmsHex.substr(i * 2, 2);
         req->parms[i] = static_cast<uint8_t>(std::stoul(byteStr, nullptr, 16));
     }
+    req->enqueuedAt = GetTickCount64();
+    req->world = GetCurrentWorldPtr();
 
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
@@ -914,7 +1111,13 @@ std::string HandleCallData(const std::string& args)
     bool serviced = g_resultCv.wait_for(lock, std::chrono::seconds(5), [&] { return req->done; });
 
     if (!serviced)
+    {
+        req->cancelled = true;   // g_resultMutex is held here (wait_for returned) - Drain will skip it
         return "ERROR timed out waiting for render thread (is the game minimized/frozen?)";
+    }
+
+    if (req->faulted && req->exceptionCode == kCallCancelledCode)
+        return "ERROR:cancelled (hook silent / world changed) - retry shortly";
 
     if (req->faulted)
     {
@@ -982,6 +1185,24 @@ static std::vector<InteractEvent> g_interactEvents;   // drained by the pipe thr
 // which the narrow match never saw at all. Used specifically for the
 // pickup-tier blocking check - NOT for chest-open reporting, which uses
 // the even narrower IsChestReportFunction below instead.
+// A function whose NAME could not be resolved must not be permanently
+// negative-cached on the first failure (GNames/AppendString can fail
+// transiently while objects are mid-construction): that would kill its
+// detection for the whole session. Only cache a negative once the name
+// resolved, or after NAME_FAIL_LIMIT failed attempts on the same pointer
+// (so a truly unresolvable one still stops costing a resolve per call).
+static std::mutex g_nameFailMutex;
+static std::unordered_map<void*, int> g_nameFailCounts;
+static const int NAME_FAIL_LIMIT = 8;
+
+static bool ShouldCacheNegative(void* function, bool nameResolved)
+{
+    if (nameResolved)
+        return true;
+    std::lock_guard<std::mutex> lock(g_nameFailMutex);
+    return ++g_nameFailCounts[function] >= NAME_FAIL_LIMIT;
+}
+
 static std::mutex g_interactFamilyClassifyMutex;
 static std::unordered_set<void*> g_interactFamilyFunctionPtrs;
 static std::unordered_set<void*> g_nonInteractFamilyFunctionPtrs;
@@ -997,7 +1218,8 @@ static bool IsInteractFamilyFunction(void* function)
     }
 
     std::string name;
-    bool isMatch = TryGetObjectName(function, name) &&
+    const bool resolved = TryGetObjectName(function, name);
+    bool isMatch = resolved &&
                    name.find("Interact") != std::string::npos;
 
     std::lock_guard<std::mutex> lock(g_interactFamilyClassifyMutex);
@@ -1008,7 +1230,8 @@ static bool IsInteractFamilyFunction(void* function)
     }
     else
     {
-        g_nonInteractFamilyFunctionPtrs.insert(function);
+        if (ShouldCacheNegative(function, resolved))
+            g_nonInteractFamilyFunctionPtrs.insert(function);
     }
     return isMatch;
 }
@@ -1035,7 +1258,8 @@ static bool IsChestReportFunction(void* function)
     }
 
     std::string name;
-    bool isMatch = TryGetObjectName(function, name) &&
+    const bool resolved = TryGetObjectName(function, name);
+    bool isMatch = resolved &&
                    name.find("OnInteract") != std::string::npos &&
                    name.find("OnInteracted") == std::string::npos;
 
@@ -1047,7 +1271,8 @@ static bool IsChestReportFunction(void* function)
     }
     else
     {
-        g_nonChestReportFunctionPtrs.insert(function);
+        if (ShouldCacheNegative(function, resolved))
+            g_nonChestReportFunctionPtrs.insert(function);
     }
     return isMatch;
 }
@@ -1205,7 +1430,8 @@ static bool IsSecretFoundFunction(void* function)
     }
     else
     {
-        g_nonSecretFunctionPtrs.insert(function);
+        if (ShouldCacheNegative(function, resolved))
+            g_nonSecretFunctionPtrs.insert(function);
     }
     return isExactMatch;
 }
@@ -1290,7 +1516,8 @@ static bool IsCurrencyValueChangedFunction(void* function)
     }
 
     std::string name;
-    bool isMatch = TryGetObjectName(function, name) && name == "OnValueChanged";
+    const bool resolved = TryGetObjectName(function, name);
+    bool isMatch = resolved && name == "OnValueChanged";
 
     std::lock_guard<std::mutex> lock(g_currencyValueClassifyMutex);
     if (isMatch)
@@ -1300,7 +1527,8 @@ static bool IsCurrencyValueChangedFunction(void* function)
     }
     else
     {
-        g_nonCurrencyValueFunctionPtrs.insert(function);
+        if (ShouldCacheNegative(function, resolved))
+            g_nonCurrencyValueFunctionPtrs.insert(function);
     }
     return isMatch;
 }
@@ -1320,7 +1548,8 @@ static bool IsCurrencyTypeChangedFunction(void* function)
     }
 
     std::string name;
-    bool isMatch = TryGetObjectName(function, name) && name == "OnCurrencyTypeChanged";
+    const bool resolved = TryGetObjectName(function, name);
+    bool isMatch = resolved && name == "OnCurrencyTypeChanged";
 
     std::lock_guard<std::mutex> lock(g_currencyTypeClassifyMutex);
     if (isMatch)
@@ -1330,7 +1559,8 @@ static bool IsCurrencyTypeChangedFunction(void* function)
     }
     else
     {
-        g_nonCurrencyTypeFunctionPtrs.insert(function);
+        if (ShouldCacheNegative(function, resolved))
+            g_nonCurrencyTypeFunctionPtrs.insert(function);
     }
     return isMatch;
 }
@@ -1397,7 +1627,8 @@ static bool IsDeathFunction(void* function)
     }
     else
     {
-        g_nonDeathFunctionPtrs.insert(function);
+        if (ShouldCacheNegative(function, resolved))
+            g_nonDeathFunctionPtrs.insert(function);
     }
     return isExactMatch;
 }
@@ -1494,7 +1725,8 @@ static bool IsMissionOutcomeFunction(void* function, std::string& outMatchedName
     }
     else
     {
-        g_nonMissionOutcomeFunctionPtrs.insert(function);
+        if (ShouldCacheNegative(function, resolved))
+            g_nonMissionOutcomeFunctionPtrs.insert(function);
     }
     return isExactMatch;
 }
@@ -1531,6 +1763,7 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
     // place to drain from - see SetupHookThread's own comment for why the
     // Present hook attempt itself was removed entirely, not just made
     // optional.
+    FlushSilenceLog();   // deferred silence-transition log lines (active hook call = safe point)
     DrainPendingCalls();
     DrainGenericWork();
 
@@ -1563,8 +1796,8 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
     // Per-actor dedupe for Supply Station reporting - see the comment at the
     // call site below for why this exists even though supply uses the same
     // trigger filter as regular chests.
-    static std::mutex g_reportedSupplyActorsMutex;
-    static std::unordered_set<uint64_t> g_reportedSupplyActors;
+    // (g_reportedSupplyActors / its mutex now live at file scope so a world
+    // change can clear them - see ClearSupplyDedupe.)
 
     // Chest-open event reporting: both regular chests AND Supply Stations
     // use IsChestReportFunction - "OnInteract" present, "OnInteracted"
@@ -1985,6 +2218,7 @@ std::string HandleRequest(const std::string& request)
     if (request == "hook_state")
     {
         EvaluateSilence();
+        FlushSilenceLog();
         std::ostringstream out;
         out << "HOOK:" << (g_hookSilent.load() ? "silent" : "active")
             << ",silent_ms=" << (g_hookSilent.load() ? (GetTickCount64() - g_silentSince.load()) : 0)
@@ -1995,7 +2229,9 @@ std::string HandleRequest(const std::string& request)
     {
         g_forceSilentUntil.store(0);
         g_hookSilent.store(false);
+        g_nullWorldGaveUp.store(true);
         LogLine("HOOK ACTIVE: hook_wake command");
+        FlushSilenceLog();
         return "OK";
     }
     if (request.rfind("hook_silence ", 0) == 0)
