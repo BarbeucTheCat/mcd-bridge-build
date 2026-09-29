@@ -273,14 +273,25 @@ static uint64_t GetCurrentWorldPtr()
 // the hook disabled, no code of ours ran inside the game, so re-arming
 // depended entirely on an external pipe command that never came.
 //
-// Here the ProcessEvent hook stays installed and enabled FOR THE WHOLE
-// SESSION (no MH_EnableHook/MH_DisableHook at runtime - MinHook freezes every
-// thread to patch, which is itself a bad thing to do mid level-load). "Silent"
-// is only an atomic flag checked at the very top of hkProcessEvent: while it
-// is set, the hook does nothing but forward to the original ProcessEvent (no
-// queue draining, no classification, no name resolution, no blocking), and
+// "Silent" is an atomic flag checked at the very top of hkProcessEvent: while
+// it is set, the hook does nothing but forward to the original ProcessEvent
+// (no queue draining, no classification, no name resolution, no blocking), and
 // the pipe handlers that would touch the game (CALL/CALLDATA/resolve/find)
 // answer "ERROR:..." immediately instead of queueing work.
+//
+// What live testing showed (Microsoft Store build):
+//   * A hook that merely FORWARDS while silent ("soft" void) was not enough:
+//     the game still crashed on the very first hub -> mission transition.
+//   * Physically UNPATCHING ProcessEvent for the whole silent window ("hard"
+//     void, see VoidControllerThread) carried nine transitions in a row,
+//     mission victory and locked-mission kills included, and /void hard no
+//     longer crashes the game. The MinHook thread-freeze that an earlier
+//     version of this comment feared mid level-load is therefore NOT the
+//     problem when it is done from the controller thread; leaving our patch
+//     in the engine's code during the transition is.
+//   * The hook must not be patched in while the engine is still booting
+//     either (see WaitForEngineBoot): early injection is fine, early patching
+//     is not.
 //
 // Because the check lives in the hook itself, re-arming needs nothing from
 // outside. Three independent ways back to ACTIVE, any one is enough:
@@ -288,7 +299,10 @@ static uint64_t GetCurrentWorldPtr()
 //   2. deadman cap  : silent for SILENCE_MAX_MS no matter what (cannot get stuck)
 //   3. hook_wake    : optional pipe command, convenience only - never required
 // Silence starts (a) at hook install, (b) whenever GWorld changes or goes
-// null (level transition), (c) on the optional hook_silence <ms> command.
+// null (level transition), (c) on the optional hook_silence <ms> command
+// (kept for tooling; the client no longer calls it - a client-side "silence
+// at mission end" switch, /endsilence, was removed: the world-change silence
+// in hard void mode already covered those transitions).
 static const ULONGLONG SILENCE_SETTLE_MS = 4000;    // world must sit still this long
 static const ULONGLONG SILENCE_MAX_MS    = 30000;   // absolute cap per silent window (world non-null)
 static const ULONGLONG SILENCE_FORCE_MAX = 30000;   // cap on hook_silence <ms>
@@ -469,7 +483,8 @@ static std::atomic<bool> g_hookInstalled{ false };
 
 // ---- "Void" state during level transitions -------------------------------
 // While silent, NOTHING of ours may run inside the game's threads. Two levels:
-//   soft (default): the detour stays patched in but its silent path is a
+//   soft (DLL start-up default, NOT the recommended mode - see below): the
+//        detour stays patched in but its silent path is a
 //        single relaxed atomic load followed by the original call. All state
 //        evaluation (settle timer, deadman, GWorld watch, log flush) is done
 //        by VoidControllerThread, not by game threads.
@@ -481,6 +496,10 @@ static std::atomic<bool> g_hookInstalled{ false };
 //        controller thread, never from a game thread).
 // Switchable live: pipe "set_void_mode soft|hard" (client: /void), or
 // DUNGEONS_BRIDGE_VOID_MODE=hard in the environment for the next launch.
+// The DLL itself starts in soft (its mode is per process); the client pushes
+// its saved choice right after injection, and that choice defaults to HARD:
+// in live tests soft crashed on the first hub -> mission transition while hard
+// went through nine in a row (see the notes at "Autonomous hook silence").
 enum VoidMode { VOID_SOFT = 0, VOID_HARD = 1 };
 static std::atomic<int>       g_voidMode{ VOID_SOFT };
 static std::atomic<bool>      g_hookPatched{ false };    // detour currently patched into ProcessEvent
