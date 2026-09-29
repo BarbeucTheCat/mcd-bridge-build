@@ -460,6 +460,48 @@ static bool EvaluateSilencePatched()
 // stale queued work on world change, deferred log queue, ...) only takes over
 // AFTER the first activation, i.e. for level transitions during play.
 static std::atomic<bool> g_everActive{ false };
+// Set when SetupHookThread has FINISHED (hook enabled, or deliberately not
+// installed: no RVA for this host / MinHook init failed). Until then
+// hook_state reports "silent": the DLL is loaded but the engine has not been
+// patched yet, and callers (the Python safety gate) must treat that exactly
+// like the silent window. Once finished it never blocks anything by itself.
+static std::atomic<bool> g_hookInstalled{ false };
+
+// ---- "Void" state during level transitions -------------------------------
+// While silent, NOTHING of ours may run inside the game's threads. Two levels:
+//   soft (default): the detour stays patched in but its silent path is a
+//        single relaxed atomic load followed by the original call. All state
+//        evaluation (settle timer, deadman, GWorld watch, log flush) is done
+//        by VoidControllerThread, not by game threads.
+//   hard: on top of soft, the controller physically UNPATCHES ProcessEvent
+//        (MH_DisableHook) for the whole silent window and re-patches it
+//        (MH_EnableHook) when the world is stable again - during the window
+//        the engine runs byte-for-byte as if this DLL had no hook at all.
+//        Costs two MinHook thread-freezes per transition (done from the
+//        controller thread, never from a game thread).
+// Switchable live: pipe "set_void_mode soft|hard" (client: /void), or
+// DUNGEONS_BRIDGE_VOID_MODE=hard in the environment for the next launch.
+enum VoidMode { VOID_SOFT = 0, VOID_HARD = 1 };
+static std::atomic<int>       g_voidMode{ VOID_SOFT };
+static std::atomic<bool>      g_hookPatched{ false };    // detour currently patched into ProcessEvent
+static std::atomic<uintptr_t> g_peTarget{ 0 };
+static std::atomic<uint32_t>  g_voidCalls{ 0 };          // safety-net counter for the silent path
+
+enum VoidAction { VOID_NONE = 0, VOID_UNPATCH = 1, VOID_REPATCH = 2 };
+
+// Pure decision, kept separate so it can be unit-tested.
+static VoidAction DecideVoidAction(bool silent, int mode, bool patched)
+{
+    if (mode == VOID_HARD)
+    {
+        if (silent && patched)  return VOID_UNPATCH;
+        if (!silent && !patched) return VOID_REPATCH;
+        return VOID_NONE;
+    }
+    // soft: never leave the hook unpatched (covers a live switch hard -> soft)
+    if (!patched) return VOID_REPATCH;
+    return VOID_NONE;
+}
 
 static void SilenceLogDirect(const char* what, uint64_t world, ULONGLONG ms)
 {
@@ -2023,7 +2065,16 @@ void LogProcessEventException()
 void hkProcessEvent(void* self, void* function, void* params)
 {
     // Silent window (startup / level transition): pure pass-through, nothing
-    // else of ours runs. See "Autonomous hook silence / re-arm" above.
+    // else of ours runs - one relaxed atomic load, then the original call.
+    // VoidControllerThread owns the state machine and re-arms; as a safety
+    // net only, one call in 1024 also evaluates it here, so a dead controller
+    // can never leave the hook silent forever.
+    if (g_hookSilent.load(std::memory_order_relaxed) &&
+        (g_voidCalls.fetch_add(1, std::memory_order_relaxed) & 0x3FF) != 0)
+    {
+        oProcessEvent(self, function, params);
+        return;
+    }
     if (EvaluateSilence())
     {
         oProcessEvent(self, function, params);
@@ -2313,9 +2364,30 @@ std::string HandleRequest(const std::string& request)
         EvaluateSilence();
         FlushSilenceLog();
         std::ostringstream out;
-        out << "HOOK:" << (g_hookSilent.load() ? "silent" : "active")
+        const bool reportSilent = g_hookSilent.load() || !g_hookInstalled.load();
+        out << "HOOK:" << (reportSilent ? "silent" : "active")
             << ",silent_ms=" << (g_hookSilent.load() ? (GetTickCount64() - g_silentSince.load()) : 0)
-            << ",world=0x" << std::hex << g_lastSeenWorld.load();
+            << ",world=0x" << std::hex << g_lastSeenWorld.load() << std::dec
+            << ",void=" << (g_voidMode.load() == VOID_HARD ? "hard" : "soft")
+            << ",patched=" << (g_hookPatched.load() ? 1 : 0);
+        return out.str();
+    }
+    if (request.rfind("set_void_mode ", 0) == 0)
+    {
+        std::string m = request.substr(std::string("set_void_mode ").size());
+        while (!m.empty() && (m.back() == '\n' || m.back() == '\r' || m.back() == ' ')) m.pop_back();
+        if (m == "soft")      g_voidMode.store(VOID_SOFT);
+        else if (m == "hard") g_voidMode.store(VOID_HARD);
+        else                  return "ERROR: void mode must be soft or hard";
+        LogLine("VOID MODE (live override): " + m);
+        return "OK";
+    }
+    if (request == "get_void_mode")
+    {
+        std::ostringstream out;
+        out << "VOID:" << (g_voidMode.load() == VOID_HARD ? "hard" : "soft")
+            << ",patched=" << (g_hookPatched.load() ? 1 : 0)
+            << ",silent=" << (g_hookSilent.load() ? 1 : 0);
         return out.str();
     }
     if (request == "hook_wake")
@@ -2483,10 +2555,106 @@ static void WorldWatchThread()
 }
 #endif
 
+// Owns the void state. Runs on its own thread, never on a game thread.
+static void VoidControllerThread()
+{
+    LogLine("VoidController: started (mode=" + std::string(g_voidMode.load() == VOID_HARD ? "hard" : "soft") + ").");
+    for (;;)
+    {
+        Sleep(20);
+
+        const bool silent = EvaluateSilence();   // drives settle / deadman / GWorld watch
+        FlushSilenceLog();
+
+        const VoidAction act = DecideVoidAction(silent, g_voidMode.load(), g_hookPatched.load());
+        if (act == VOID_UNPATCH)
+        {
+            MH_STATUS st = MH_DisableHook(reinterpret_cast<void*>(g_peTarget.load()));
+            if (st == MH_OK)
+                g_hookPatched.store(false);
+            LogLine("VOID HARD: ProcessEvent UNPATCHED for the silent window, MH_DisableHook status=" +
+                    std::to_string(static_cast<int>(st)));
+        }
+        else if (act == VOID_REPATCH)
+        {
+            MH_STATUS st = MH_EnableHook(reinterpret_cast<void*>(g_peTarget.load()));
+            if (st == MH_OK)
+                g_hookPatched.store(true);
+            LogLine("VOID: ProcessEvent RE-PATCHED, MH_EnableHook status=" +
+                    std::to_string(static_cast<int>(st)));
+        }
+    }
+}
+
+// The inline hook is only PATCHED into the game once the engine has finished
+// booting, i.e. once its first UWorld exists and has stayed the same for this
+// long. Evidence (Microsoft Store build, client started BEFORE the game): with
+// the hook enabled ~3 s after an early injection the game died 10-16 s after
+// process start, inside FEngineLoop init, with no dungeons_bridge / ProcessEvent
+// frame in the crash stack and GWorld still 0 the whole time - and that also
+// happened with the "launch-parity" state machine, so the trigger is the
+// patching of the engine's code during its own init, not the silence logic.
+// Injecting the DLL early is fine (client A/B test); pipe server, pickup tier
+// and hook_state (= "silent") are all available while we wait.
+static const ULONGLONG HOOK_INSTALL_WORLD_STABLE_MS = 6000;
+// Fail-open cap: if GWorld never becomes valid (e.g. a stale offset after a
+// game update) the hook is installed anyway, exactly as before this guard.
+static const ULONGLONG HOOK_INSTALL_MAX_WAIT_MS = 180000;
+
+static void WaitForEngineBoot()
+{
+    if (!Offsets::GWorld)
+        return;   // no GWorld offset for this host: nothing to wait on
+
+    const ULONGLONG waitStart = GetTickCount64();
+    ULONGLONG nonNullSince = 0;
+    uint64_t lastWorld = 0;
+    ULONGLONG lastLog = 0;
+
+    for (;;)
+    {
+        const ULONGLONG now = GetTickCount64();
+        const uint64_t world = GetCurrentWorldPtr();
+
+        if (world != 0)
+        {
+            if (nonNullSince == 0 || world != lastWorld)
+                nonNullSince = now;
+            if (now - nonNullSince >= HOOK_INSTALL_WORLD_STABLE_MS)
+            {
+                LogLine("Engine boot finished (GWorld stable) - installing the ProcessEvent hook now.");
+                return;
+            }
+        }
+        else
+        {
+            nonNullSince = 0;
+        }
+        lastWorld = world;
+
+        if (now - waitStart >= HOOK_INSTALL_MAX_WAIT_MS)
+        {
+            LogLine("WARNING: GWorld never became valid within the wait cap - installing the hook anyway.");
+            return;
+        }
+
+        if (now - lastLog >= 5000)
+        {
+            lastLog = now;
+            std::ostringstream o;
+            o << "WAIT engine boot: tick=" << now << " GWorld=0x" << std::hex << world
+              << " (hook not installed yet, state=silent)";
+            LogLine(o.str());
+        }
+        Sleep(250);
+    }
+}
+
 void SetupHookThread()
 {
     LogLine("=== SetupHookThread starting (new session) ===");
-    LogLine("BUILD: silence + safety patch, launch-parity guard v1 (original start-up logic until the first ACTIVE)");
+    LogLine("BUILD: silence + safety patch, launch-parity guard v1 + boot-wait v2 + void controller v3 (soft/hard void during transitions)");
+    struct SetupDone { ~SetupDone() { g_hookInstalled.store(true); } } setupDone;   // every exit path, incl. early returns
     // Small delay so classification/hooking doesn't start before the game's
     // own early init has had a chance to settle.
     Sleep(3000);
@@ -2497,6 +2665,12 @@ void SetupHookThread()
         LogLine("SetupHookThread: no ProcessEvent RVA for this host - installing NO hooks (passive).");
         return;
     }
+
+    // Breadcrumbs from here on (timeline of GWorld / silence during the wait).
+#if BRIDGE_WORLD_WATCH
+    std::thread(WorldWatchThread).detach();
+#endif
+    WaitForEngineBoot();
 
     MH_STATUS initStatus = MH_Initialize();
     LogLine("MH_Initialize status: " + std::to_string(static_cast<int>(initStatus)));
@@ -2515,6 +2689,7 @@ void SetupHookThread()
     // just forwards to oProcessEvent when it's not an OnOpenLootChest call),
     // so nothing about the existing CALL functionality changes.
     uintptr_t peAddr = GetImageBase() + Offsets::ProcessEvent;
+    g_peTarget.store(peAddr);
     LogLine("ProcessEvent target address: 0x" + [&]{ std::ostringstream o; o << std::hex << peAddr; return o.str(); }());
     MH_STATUS peStatus = MH_CreateHook(reinterpret_cast<void*>(peAddr),
                   reinterpret_cast<void*>(&hkProcessEvent), reinterpret_cast<void**>(&oProcessEvent));
@@ -2522,14 +2697,22 @@ void SetupHookThread()
 
     // Start SILENT (flag only): the hook is enabled for good right below and
     // never toggled again; it wakes itself once the world has been stable.
+    g_everActive.store(false);   // hook_state polls during the wait may have flipped it: the launch-parity guard applies from the real install
     InitSilenceAtInstall();
     LogLine("HOOK SILENT at install - will self-activate after the world is stable (or after the deadman cap).");
 
     MH_STATUS enableStatus = MH_EnableHook(MH_ALL_HOOKS);
     LogLine("MH_EnableHook(MH_ALL_HOOKS) status: " + std::to_string(static_cast<int>(enableStatus)));
-#if BRIDGE_WORLD_WATCH
-    std::thread(WorldWatchThread).detach();
-#endif
+
+    if (enableStatus == MH_OK && peStatus == MH_OK)
+    {
+        g_hookPatched.store(true);
+        char modeBuf[16] = { 0 };
+        DWORD n = GetEnvironmentVariableA("DUNGEONS_BRIDGE_VOID_MODE", modeBuf, sizeof(modeBuf));
+        if (n > 0 && n < sizeof(modeBuf) && std::string(modeBuf) == "hard")
+            g_voidMode.store(VOID_HARD);
+        std::thread(VoidControllerThread).detach();
+    }
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
