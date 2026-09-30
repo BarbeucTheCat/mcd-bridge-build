@@ -506,6 +506,15 @@ static std::atomic<bool>      g_hookPatched{ false };    // detour currently pat
 static std::atomic<uintptr_t> g_peTarget{ 0 };
 static std::atomic<uint32_t>  g_voidCalls{ 0 };          // safety-net counter for the silent path
 
+// Crash guard state (the guard itself is defined further down, see "Crash guard").
+static const int GUARD_MAX_SITES = 16;
+static std::atomic<uintptr_t> g_guardSites[GUARD_MAX_SITES];
+static std::atomic<int>       g_guardSiteCount{ 0 };
+static std::atomic<bool>      g_guardEnabled{ true };
+static std::atomic<uint32_t>  g_guardHits{ 0 };
+static std::atomic<uintptr_t> g_guardLastRip{ 0 };
+static std::atomic<uintptr_t> g_guardBase{ 0 };
+
 enum VoidAction { VOID_NONE = 0, VOID_UNPATCH = 1, VOID_REPATCH = 2 };
 
 // Pure decision, kept separate so it can be unit-tested.
@@ -2401,6 +2410,23 @@ std::string HandleRequest(const std::string& request)
         LogLine("VOID MODE (live override): " + m);
         return "OK";
     }
+    if (request.rfind("set_crash_guard ", 0) == 0)
+    {
+        std::string m = request.substr(std::string("set_crash_guard ").size());
+        while (!m.empty() && (m.back() == '\n' || m.back() == '\r' || m.back() == ' ')) m.pop_back();
+        if (m == "on")       g_guardEnabled.store(true);
+        else if (m == "off") g_guardEnabled.store(false);
+        else                 return "ERROR: crash guard must be on or off";
+        LogLine("CRASH GUARD (live override): " + m);
+        return "OK";
+    }
+    if (request == "get_crash_guard")
+    {
+        std::ostringstream out;
+        out << "GUARD:enabled=" << (g_guardEnabled.load() ? 1 : 0)
+            << ",sites=" << g_guardSiteCount.load() << ",hits=" << g_guardHits.load();
+        return out.str();
+    }
     if (request == "get_void_mode")
     {
         std::ostringstream out;
@@ -2574,13 +2600,210 @@ static void WorldWatchThread()
 }
 #endif
 
+// ---- Crash guard: null GetX(this,0)->member read in the game's tick -------
+// Two separate live crashes (Microsoft Store build, different sessions, ~15 min
+// after the last level load, no transition and no void window in progress, no
+// dungeons_bridge / ProcessEvent frame anywhere in the stack) died at the very
+// same instruction with the very same 16-frame stack:
+//
+//     33 D2                xor  edx,edx
+//     48 8B CB             mov  rcx,rbx
+//     E8 xx xx xx xx       call <getter>            ; returns NULL here
+//     48 8B 98 C8 03 00 00 mov  rbx,[rax+3C8h]      ; <- access violation, read of 0x3C8
+//     48 85 DB             test rbx,rbx
+//     74 30                jz   <null path>         ; the game ALREADY handles a null rbx
+//
+// i.e. the game null-checks the loaded member but not the pointer it comes
+// from (looks like GetPlayerController(...,0) coming back NULL). Treating
+// "rax == NULL" as "member == NULL" takes exactly the branch the game itself
+// wrote for a null member: this handler sets rbx = 0 and steps over the load.
+// It only ever acts on a read of address 0x3C8 with rax == 0 at a site that
+// matched the byte pattern at start-up - anything else is passed on untouched,
+// so it cannot hide any other kind of crash. No allocation, no locks, no file
+// I/O inside the handler (hits are only counted; the controller thread logs).
+//
+// Note: this removes the symptom (the crash), not the cause (why no player
+// controller exists at that moment - the log lines around each guard hit,
+// written by VoidControllerThread, are there to find out).
+
+// -1 = wildcard
+static const int16_t kGuardPattern[] = {
+    0x33, 0xD2, 0x48, 0x8B, 0xCB, 0xE8, -1, -1, -1, -1,
+    0x48, 0x8B, 0x98, 0xC8, 0x03, 0x00, 0x00, 0x48, 0x85, 0xDB, 0x74 };
+static const size_t kGuardPatternLen = sizeof(kGuardPattern) / sizeof(kGuardPattern[0]);
+static const size_t kGuardFaultOffset = 10;   // "mov rbx,[rax+3C8h]" inside the pattern
+static const size_t kGuardInstrLen = 7;       // its length
+static const uintptr_t kGuardFaultDisp = 0x3C8;
+
+// Pure: finds the pattern in [mem, mem+size); returns absolute addresses of the
+// faulting instruction (memBase + offset) - separate so it can be unit-tested.
+static size_t FindGuardSites(const uint8_t* mem, size_t size, uintptr_t memBase, uintptr_t* out, size_t maxOut)
+{
+    size_t n = 0;
+    if (size < kGuardPatternLen)
+        return 0;
+    for (size_t i = 0; i + kGuardPatternLen <= size && n < maxOut; ++i)
+    {
+        if (mem[i] != 0x33)
+            continue;
+        bool ok = true;
+        for (size_t j = 1; j < kGuardPatternLen; ++j)
+        {
+            const int16_t want = kGuardPattern[j];
+            if (want >= 0 && mem[i + j] != static_cast<uint8_t>(want)) { ok = false; break; }
+        }
+        if (ok)
+            out[n++] = memBase + i + kGuardFaultOffset;
+    }
+    return n;
+}
+
+// Pure decision, kept separate so it can be unit-tested.
+static bool GuardShouldRecover(bool enabled, DWORD code, uintptr_t faultRip, uint64_t readWrite,
+                               uint64_t faultAddr, uint64_t rax,
+                               const uintptr_t* sites, int siteCount)
+{
+    if (!enabled) return false;
+    if (code != EXCEPTION_ACCESS_VIOLATION) return false;
+    if (readWrite != 0 || faultAddr != kGuardFaultDisp || rax != 0) return false;
+    for (int i = 0; i < siteCount; ++i)
+        if (sites[i] == faultRip) return true;
+    return false;
+}
+
+static LONG CALLBACK CrashGuardVeh(PEXCEPTION_POINTERS info)
+{
+    const EXCEPTION_RECORD* er = info->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    uintptr_t sites[GUARD_MAX_SITES];
+    const int count = g_guardSiteCount.load(std::memory_order_acquire);
+    for (int i = 0; i < count && i < GUARD_MAX_SITES; ++i)
+        sites[i] = g_guardSites[i].load(std::memory_order_relaxed);
+
+    CONTEXT* c = info->ContextRecord;
+    const uintptr_t rip = reinterpret_cast<uintptr_t>(er->ExceptionAddress);
+    if (!GuardShouldRecover(g_guardEnabled.load(std::memory_order_relaxed), er->ExceptionCode, rip,
+                            er->ExceptionInformation[0], er->ExceptionInformation[1], c->Rax,
+                            sites, count))
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    c->Rbx = 0;                 // "member is null" - the game's own jz handles it
+    c->Rip += kGuardInstrLen;   // step over "mov rbx,[rax+3C8h]"
+    g_guardLastRip.store(rip, std::memory_order_relaxed);
+    g_guardHits.fetch_add(1, std::memory_order_relaxed);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// Reading a code section can't normally fault, but never let a scan take the
+// game down: POD-only helper so __try is allowed.
+static size_t ScanRegionSafe(uintptr_t start, size_t size, uintptr_t* out, size_t maxOut)
+{
+    __try
+    {
+        return FindGuardSites(reinterpret_cast<const uint8_t*>(start), size, start, out, maxOut);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0;
+    }
+}
+
+static void InstallCrashGuard()
+{
+    char envBuf[16] = { 0 };
+    DWORD envLen = GetEnvironmentVariableA("DUNGEONS_BRIDGE_CRASH_GUARD", envBuf, sizeof(envBuf));
+    if (envLen > 0 && envLen < sizeof(envBuf) && std::string(envBuf) == "off")
+    {
+        g_guardEnabled.store(false);
+        LogLine("CRASH GUARD: disabled by DUNGEONS_BRIDGE_CRASH_GUARD=off (not armed).");
+        return;
+    }
+
+    const uintptr_t base = GetImageBase();
+    g_guardBase.store(base);
+    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return;
+    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return;
+
+    uintptr_t found[GUARD_MAX_SITES];
+    int total = 0;
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections && total < GUARD_MAX_SITES; ++i, ++sec)
+    {
+        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE))
+            continue;
+        total += static_cast<int>(ScanRegionSafe(base + sec->VirtualAddress, sec->Misc.VirtualSize,
+                                                 found + total, GUARD_MAX_SITES - total));
+    }
+
+    if (total == 0)
+    {
+        LogLine("CRASH GUARD: pattern not found in this build - not armed (nothing is patched or hidden).");
+        return;
+    }
+    for (int i = 0; i < total; ++i)
+    {
+        g_guardSites[i].store(found[i], std::memory_order_relaxed);
+        std::ostringstream o;
+        o << "CRASH GUARD: armed at Dungeons image + 0x" << std::hex << (found[i] - base);
+        LogLine(o.str());
+    }
+    g_guardSiteCount.store(total, std::memory_order_release);
+    PVOID handle = AddVectoredExceptionHandler(1, CrashGuardVeh);
+    LogLine(handle ? "CRASH GUARD: exception handler installed."
+                   : "CRASH GUARD: AddVectoredExceptionHandler FAILED - not armed.");
+}
+
+static std::atomic<ULONGLONG> g_dllStartTick{ 0 };
+
 // Owns the void state. Runs on its own thread, never on a game thread.
 static void VoidControllerThread()
 {
     LogLine("VoidController: started (mode=" + std::string(g_voidMode.load() == VOID_HARD ? "hard" : "soft") + ").");
+    ULONGLONG nextHeartbeat = GetTickCount64() + 60000;
+    uint32_t guardLogged = 0;
     for (;;)
     {
         Sleep(20);
+
+        // One line a minute: how long the game has been up / in the current
+        // level. Two crashes happened ~15 min after a level load - this shows
+        // whether that is a pattern.
+        {
+            const ULONGLONG nowHb = GetTickCount64();
+            if (nowHb >= nextHeartbeat)
+            {
+                nextHeartbeat = nowHb + 60000;
+                std::ostringstream o;
+                o << "HEARTBEAT: up=" << (nowHb - g_dllStartTick.load()) / 60000.0 << " min, in-level="
+                  << (nowHb - g_lastWorldChange.load()) / 60000.0 << " min, silent=" << (g_hookSilent.load() ? 1 : 0)
+                  << ", patched=" << (g_hookPatched.load() ? 1 : 0) << ", guardHits=" << g_guardHits.load()
+                  << ", world=0x" << std::hex << g_lastSeenWorld.load();
+                LogLine(o.str());
+            }
+        }
+
+        // The crash guard only counts in the handler; report from here.
+        {
+            const uint32_t hits = g_guardHits.load();
+            if (hits != guardLogged)
+            {
+                const ULONGLONG nowG = GetTickCount64();
+                std::ostringstream o;
+                o << "CRASH GUARD: recovered " << (hits - guardLogged) << " null-pointer read(s) at image + 0x"
+                  << std::hex << (g_guardLastRip.load() - g_guardBase.load()) << std::dec
+                  << " - game kept running. total=" << hits << ", in-level="
+                  << (nowG - g_lastWorldChange.load()) / 60000.0 << " min, up="
+                  << (nowG - g_dllStartTick.load()) / 60000.0 << " min, world=0x" << std::hex << g_lastSeenWorld.load();
+                LogLine(o.str());
+                guardLogged = hits;
+            }
+        }
 
         const bool silent = EvaluateSilence();   // drives settle / deadman / GWorld watch
         FlushSilenceLog();
@@ -2689,7 +2912,9 @@ void SetupHookThread()
 #if BRIDGE_WORLD_WATCH
     std::thread(WorldWatchThread).detach();
 #endif
+    g_dllStartTick.store(GetTickCount64());
     WaitForEngineBoot();
+    InstallCrashGuard();   // independent of the hook: works even if MinHook fails below
 
     MH_STATUS initStatus = MH_Initialize();
     LogLine("MH_Initialize status: " + std::to_string(static_cast<int>(initStatus)));
