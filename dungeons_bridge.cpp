@@ -509,11 +509,46 @@ static std::atomic<uint32_t>  g_voidCalls{ 0 };          // safety-net counter f
 // Crash guard state (the guard itself is defined further down, see "Crash guard").
 static const int GUARD_MAX_SITES = 16;
 static std::atomic<uintptr_t> g_guardSites[GUARD_MAX_SITES];
+static std::atomic<int>       g_guardSiteRule[GUARD_MAX_SITES];   // index into kGuardRules for each armed site
+static std::atomic<int>       g_guardLastRule{ -1 };
 static std::atomic<int>       g_guardSiteCount{ 0 };
 static std::atomic<bool>      g_guardEnabled{ true };
 static std::atomic<uint32_t>  g_guardHits{ 0 };
 static std::atomic<uintptr_t> g_guardLastRip{ 0 };
 static std::atomic<uintptr_t> g_guardBase{ 0 };
+
+// ---- Flight recorder (black-screen investigation) -----------------------------------------------------------
+// Symptom: some 12-16 minutes into a level the game loses its LOCAL PLAYER ("No local players" on the client
+// side): the screen goes black and the game's tick then reads a NULL player controller ~10x per second, which the
+// crash guard turns into "CRASH GUARD: recovered ..." lines instead of a crash. Nothing in the log says WHY the
+// player disappears, so this keeps the last FR_SIZE ProcessEvent calls (raw pointers only: one atomic increment
+// and three stores per call, no name lookups, no locks) and FREEZES them at the first guard hit of an episode.
+// The controller thread then resolves the names and writes them to the log (DumpFlightRecorder): the calls that
+// came right before the player vanished, plus any call to a function that can remove a local player
+// (RemovePlayer, HandleControllerConnectionChange, HandleLocalPlayerLeave, OnUserSignedOut...).
+// The VEH handler only sets atomics (no allocation, no lock, no I/O); at most one dump per minute.
+// "dump_recorder" over the pipe dumps the live ring on demand.
+static const uint32_t FR_SIZE = 16384;               // power of two
+struct FrEntry { void* fn; void* self; uint32_t tick; };
+static FrEntry                g_frRing[FR_SIZE];     // static storage = zero-initialised
+static std::atomic<uint32_t>  g_frHead{ 0 };         // total calls recorded (index = head & (FR_SIZE - 1))
+static std::atomic<bool>      g_frFrozen{ false };
+static std::atomic<uint32_t>  g_frFrozenHead{ 0 };
+static std::atomic<ULONGLONG> g_frFrozenTick{ 0 };
+static std::atomic<ULONGLONG> g_frLastDumpMs{ 0 };
+
+static inline void FlightRecord(void* self, void* function)
+{
+    if (g_frFrozen.load(std::memory_order_relaxed))
+        return;
+    const uint32_t i = g_frHead.fetch_add(1, std::memory_order_relaxed);
+    FrEntry& e = g_frRing[i & (FR_SIZE - 1)];
+    e.fn = function;
+    e.self = self;
+    e.tick = GetTickCount();
+}
+
+static void DumpFlightRecorder();   // defined with the crash guard, below
 
 enum VoidAction { VOID_NONE = 0, VOID_UNPATCH = 1, VOID_REPATCH = 2 };
 
@@ -2164,7 +2199,8 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
     // "OnInteracted") - the actual pickup effect can apply during the
     // EARLIER "OnInteract" call, so only blocking "OnInteracted" let it
     // through too late to matter. See IsInteractFamilyFunction's comment.
-    if (IsInteractFamilyFunction(function))
+    const bool isInteractFn = IsInteractFamilyFunction(function);   // classified once, reused by the eye block below
+    if (isInteractFn)
     {
         std::string className;
         if (TryGetClassName(self, className))
@@ -2184,7 +2220,7 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
     if (!blocked && g_blockEyePickup.load(std::memory_order_relaxed))
     {
         bool eyeCall = IsEyePickupFunction(function);
-        if (!eyeCall && IsInteractFamilyFunction(function))
+        if (!eyeCall && isInteractFn)
             eyeCall = IsEyeOfEnderObject(self);
         if (eyeCall)
         {
@@ -2397,6 +2433,8 @@ void hkProcessEvent(void* self, void* function, void* params)
         oProcessEvent(self, function, params);
         return;
     }
+
+    FlightRecord(self, function);   // black-screen investigation, see "Flight recorder"
 
     bool blocked = false;
     __try
@@ -2687,6 +2725,17 @@ std::string HandleRequest(const std::string& request)
         return "OK";
     }
 
+    if (request == "dump_recorder")
+    {
+        // On-demand flight recorder dump (e.g. right after a black screen with no guard hit): freezes the ring
+        // now, logs it, resumes recording. The result is in the DLL log ("FLIGHT RECORDER: ...").
+        g_frFrozenHead.store(g_frHead.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        g_frFrozenTick.store(GetTickCount64(), std::memory_order_relaxed);
+        g_frFrozen.store(true, std::memory_order_release);
+        DumpFlightRecorder();
+        return "OK";
+    }
+
     if (request == "get_block_eyes")
     {
         return g_blockEyePickup.load(std::memory_order_relaxed) ? "BLOCK_EYES:1" : "BLOCK_EYES:0";
@@ -2939,49 +2988,103 @@ static void WorldWatchThread()
 // controller exists at that moment - the log lines around each guard hit,
 // written by VoidControllerThread, are there to find out).
 
-// -1 = wildcard
-static const int16_t kGuardPattern[] = {
+// A guard RULE describes one known "null object" crash site of the game. Rule 0 is the crash described above. Rule 1
+// was added after a third live crash (UE4Minidump, 2026-10-14, 96 min after the game started, unhandled exception,
+// no dungeons_bridge frame in the stack, RIP inside Dungeons.exe):
+//
+//     48 89 6C 24 10 / 48 89 74 24 18 / 57 / 48 83 EC 20    prologue of a small method (this, bool, bool)
+//     48 8B F9             mov  rdi,rcx                        ; this
+//     41 0F B6 F0          movzx esi,r8b
+//     48 8B 49 30          mov  rcx,[rcx+30h]                  ; <- access violation, read of 0x30, rcx (this) == NULL
+//     0F B6 EA             movzx ebp,dl
+//     48 85 C9             test rcx,rcx
+//     74 70                je   <epilogue>                     ; the game ALREADY handles a null member
+//
+// Same shape as rule 0 (a null pointer reaches a method that null-checks the member it loads but not the pointer
+// itself - again most likely the player/controller object that no longer exists once the local player is lost):
+// setting rcx = 0 and stepping over the 4-byte load takes exactly the branch the game wrote for "member is null",
+// which restores rbp/rsi from the frame and returns. It only acts on a read of 0x30 with rcx == 0 at a site that
+// matched the byte pattern at start-up.
+
+enum GuardReg { GR_RAX = 0, GR_RCX, GR_RDX, GR_RBX, GR_RSI, GR_RDI, GR_COUNT };
+
+struct GuardRule
+{
+    const char*    name;
+    const int16_t* pattern;      // -1 = wildcard; pattern[0] must be a real byte
+    size_t         patternLen;
+    size_t         faultOffset;  // the faulting instruction inside the pattern
+    size_t         instrLen;     // its length
+    uintptr_t      faultDisp;    // the address it must fault on (the member offset, base register being NULL)
+    GuardReg       baseReg;      // register that holds the NULL pointer
+    GuardReg       destReg;      // register the skipped load would have filled: set to 0
+};
+
+static const int16_t kGuardPatternTick[] = {
     0x33, 0xD2, 0x48, 0x8B, 0xCB, 0xE8, -1, -1, -1, -1,
     0x48, 0x8B, 0x98, 0xC8, 0x03, 0x00, 0x00, 0x48, 0x85, 0xDB, 0x74 };
-static const size_t kGuardPatternLen = sizeof(kGuardPattern) / sizeof(kGuardPattern[0]);
-static const size_t kGuardFaultOffset = 10;   // "mov rbx,[rax+3C8h]" inside the pattern
-static const size_t kGuardInstrLen = 7;       // its length
-static const uintptr_t kGuardFaultDisp = 0x3C8;
 
-// Pure: finds the pattern in [mem, mem+size); returns absolute addresses of the
-// faulting instruction (memBase + offset) - separate so it can be unit-tested.
-static size_t FindGuardSites(const uint8_t* mem, size_t size, uintptr_t memBase, uintptr_t* out, size_t maxOut)
+static const int16_t kGuardPatternNullThis[] = {
+    0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x20,
+    0x48, 0x8B, 0xF9, 0x41, 0x0F, 0xB6, 0xF0, 0x48, 0x8B, 0x49, 0x30, 0x0F, 0xB6, 0xEA,
+    0x48, 0x85, 0xC9, 0x74, 0x70, 0x41, 0x0F, 0xB6, 0xD0, 0x48, 0x89, 0x5C, 0x24, 0x30,
+    0xE8, -1, -1, -1, -1, 0x48, 0x8B, 0xD8, 0x40, 0x84, 0xED, 0x74, 0x40,
+    0x83, 0xBF, 0x90, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x37 };
+
+static const GuardRule kGuardRules[] = {
+    { "tick: GetPlayerController(..,0)->member @0x3C8", kGuardPatternTick,
+      sizeof(kGuardPatternTick) / sizeof(kGuardPatternTick[0]), 10, 7, 0x3C8, GR_RAX, GR_RBX },
+    { "null this: this->member @0x30", kGuardPatternNullThis,
+      sizeof(kGuardPatternNullThis) / sizeof(kGuardPatternNullThis[0]), 22, 4, 0x30, GR_RCX, GR_RCX },
+};
+static const int kGuardRuleCount = static_cast<int>(sizeof(kGuardRules) / sizeof(kGuardRules[0]));
+
+// Pure: finds one rule's pattern in [mem, mem+size); returns the absolute addresses of the faulting instruction
+// (memBase + offset) - separate so it can be unit-tested.
+static size_t FindGuardSites(const GuardRule& rule, const uint8_t* mem, size_t size, uintptr_t memBase,
+                             uintptr_t* out, size_t maxOut)
 {
     size_t n = 0;
-    if (size < kGuardPatternLen)
+    if (size < rule.patternLen)
         return 0;
-    for (size_t i = 0; i + kGuardPatternLen <= size && n < maxOut; ++i)
+    const uint8_t first = static_cast<uint8_t>(rule.pattern[0]);
+    for (size_t i = 0; i + rule.patternLen <= size && n < maxOut; ++i)
     {
-        if (mem[i] != 0x33)
+        if (mem[i] != first)
             continue;
         bool ok = true;
-        for (size_t j = 1; j < kGuardPatternLen; ++j)
+        for (size_t j = 1; j < rule.patternLen; ++j)
         {
-            const int16_t want = kGuardPattern[j];
+            const int16_t want = rule.pattern[j];
             if (want >= 0 && mem[i + j] != static_cast<uint8_t>(want)) { ok = false; break; }
         }
         if (ok)
-            out[n++] = memBase + i + kGuardFaultOffset;
+            out[n++] = memBase + i + rule.faultOffset;
     }
     return n;
 }
 
-// Pure decision, kept separate so it can be unit-tested.
-static bool GuardShouldRecover(bool enabled, DWORD code, uintptr_t faultRip, uint64_t readWrite,
-                               uint64_t faultAddr, uint64_t rax,
-                               const uintptr_t* sites, int siteCount)
+// Pure decision, kept separate so it can be unit-tested: the index of the rule to apply, or -1 to pass the
+// exception on untouched. regs is indexed by GuardReg.
+static int GuardMatch(bool enabled, DWORD code, uintptr_t faultRip, uint64_t readWrite, uint64_t faultAddr,
+                      const uint64_t* regs, const uintptr_t* sites, const int* siteRules, int siteCount)
 {
-    if (!enabled) return false;
-    if (code != EXCEPTION_ACCESS_VIOLATION) return false;
-    if (readWrite != 0 || faultAddr != kGuardFaultDisp || rax != 0) return false;
+    if (!enabled) return -1;
+    if (code != EXCEPTION_ACCESS_VIOLATION) return -1;
+    if (readWrite != 0) return -1;
     for (int i = 0; i < siteCount; ++i)
-        if (sites[i] == faultRip) return true;
-    return false;
+    {
+        if (sites[i] != faultRip)
+            continue;
+        const int ruleIdx = siteRules[i];
+        if (ruleIdx < 0 || ruleIdx >= kGuardRuleCount)
+            return -1;
+        const GuardRule& r = kGuardRules[ruleIdx];
+        if (faultAddr != r.faultDisp || regs[r.baseReg] != 0)
+            return -1;
+        return ruleIdx;
+    }
+    return -1;
 }
 
 static LONG CALLBACK CrashGuardVeh(PEXCEPTION_POINTERS info)
@@ -2991,36 +3094,169 @@ static LONG CALLBACK CrashGuardVeh(PEXCEPTION_POINTERS info)
         return EXCEPTION_CONTINUE_SEARCH;
 
     uintptr_t sites[GUARD_MAX_SITES];
+    int siteRules[GUARD_MAX_SITES];
     const int count = g_guardSiteCount.load(std::memory_order_acquire);
     for (int i = 0; i < count && i < GUARD_MAX_SITES; ++i)
+    {
         sites[i] = g_guardSites[i].load(std::memory_order_relaxed);
+        siteRules[i] = g_guardSiteRule[i].load(std::memory_order_relaxed);
+    }
 
     CONTEXT* c = info->ContextRecord;
     const uintptr_t rip = reinterpret_cast<uintptr_t>(er->ExceptionAddress);
-    if (!GuardShouldRecover(g_guardEnabled.load(std::memory_order_relaxed), er->ExceptionCode, rip,
-                            er->ExceptionInformation[0], er->ExceptionInformation[1], c->Rax,
-                            sites, count))
+    const uint64_t regs[GR_COUNT] = { c->Rax, c->Rcx, c->Rdx, c->Rbx, c->Rsi, c->Rdi };
+    const int rule = GuardMatch(g_guardEnabled.load(std::memory_order_relaxed), er->ExceptionCode, rip,
+                                er->ExceptionInformation[0], er->ExceptionInformation[1], regs,
+                                sites, siteRules, count);
+    if (rule < 0)
         return EXCEPTION_CONTINUE_SEARCH;
 
-    c->Rbx = 0;                 // "member is null" - the game's own jz handles it
-    c->Rip += kGuardInstrLen;   // step over "mov rbx,[rax+3C8h]"
+    const GuardRule& r = kGuardRules[rule];
+    switch (r.destReg)          // "member is null" - the game's own jz/je handles it
+    {
+    case GR_RAX: c->Rax = 0; break;
+    case GR_RCX: c->Rcx = 0; break;
+    case GR_RDX: c->Rdx = 0; break;
+    case GR_RBX: c->Rbx = 0; break;
+    case GR_RSI: c->Rsi = 0; break;
+    case GR_RDI: c->Rdi = 0; break;
+    default: return EXCEPTION_CONTINUE_SEARCH;
+    }
+    c->Rip += r.instrLen;       // step over the faulting load
     g_guardLastRip.store(rip, std::memory_order_relaxed);
+    g_guardLastRule.store(rule, std::memory_order_relaxed);
     g_guardHits.fetch_add(1, std::memory_order_relaxed);
+
+    // First hit of an episode (nothing dumped for a minute): freeze the flight recorder so the calls that led up
+    // to the lost player are kept. Atomics only - this runs inside the exception handler.
+    {
+        const ULONGLONG nowMs = GetTickCount64();
+        bool expected = false;
+        if (nowMs - g_frLastDumpMs.load(std::memory_order_relaxed) > 60000 &&
+            g_frFrozen.compare_exchange_strong(expected, true))
+        {
+            g_frFrozenHead.store(g_frHead.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            g_frFrozenTick.store(nowMs, std::memory_order_relaxed);
+        }
+    }
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 // Reading a code section can't normally fault, but never let a scan take the
 // game down: POD-only helper so __try is allowed.
-static size_t ScanRegionSafe(uintptr_t start, size_t size, uintptr_t* out, size_t maxOut)
+static size_t ScanRegionSafe(int ruleIdx, uintptr_t start, size_t size, uintptr_t* out, size_t maxOut)
 {
     __try
     {
-        return FindGuardSites(reinterpret_cast<const uint8_t*>(start), size, start, out, maxOut);
+        return FindGuardSites(kGuardRules[ruleIdx], reinterpret_cast<const uint8_t*>(start), size, start, out, maxOut);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         return 0;
     }
+}
+
+// Names (substrings) of functions that can take a local player away from the game.
+static const char* const kLocalPlayerLossNeedles[] = {
+    "RemovePlayer", "RemoveLocalPlayer", "HandleControllerConnectionChange", "HandleLocalPlayerLeave",
+    "OnUserSignedOut", "OnControllerConnectionChanged", "GetControllerDisconnectedMessage",
+    "ControllerDisconnect", "LocalPlayerLeave", "SignedOut",
+};
+
+static bool IsLocalPlayerLossName(const std::string& name)
+{
+    for (const char* needle : kLocalPlayerLossNeedles)
+        if (name.find(needle) != std::string::npos)
+            return true;
+    return false;
+}
+
+// Resolves and logs the frozen ring: how many calls / distinct functions, every suspect call, the busiest
+// functions, and the last 80 calls (oldest first, "-ms" = time before the freeze). Unfreezes at the end.
+static void DumpFlightRecorder()
+{
+    const uint32_t head = g_frFrozenHead.load(std::memory_order_relaxed);
+    const uint32_t count = head < FR_SIZE ? head : FR_SIZE;
+    const uint32_t frozenTick32 = static_cast<uint32_t>(g_frFrozenTick.load(std::memory_order_relaxed));
+
+    std::unordered_map<void*, std::string> names;
+    std::unordered_map<void*, uint32_t> counts;
+    auto nameOf = [&](void* fn) -> const std::string& {
+        auto it = names.find(fn);
+        if (it != names.end())
+            return it->second;
+        std::string n;
+        if (!TryGetObjectName(fn, n))
+            n = "?";
+        return names.emplace(fn, n).first->second;
+    };
+
+    for (uint32_t k = 0; k < count; ++k)
+    {
+        const FrEntry e = g_frRing[(head - count + k) & (FR_SIZE - 1)];
+        if (e.fn)
+            ++counts[e.fn];
+    }
+
+    {
+        std::ostringstream o;
+        o << "FLIGHT RECORDER: first guard hit of an episode - last " << count
+          << " ProcessEvent calls before it, " << counts.size() << " distinct functions.";
+        LogLine(o.str());
+    }
+
+    int suspectsLogged = 0;
+    for (uint32_t k = 0; k < count && suspectsLogged < 40; ++k)
+    {
+        const FrEntry e = g_frRing[(head - count + k) & (FR_SIZE - 1)];
+        if (!e.fn)
+            continue;
+        const std::string& fname = nameOf(e.fn);
+        if (!IsLocalPlayerLossName(fname))
+            continue;
+        std::string cls = "?";
+        TryGetClassName(e.self, cls);
+        std::ostringstream o;
+        o << "FLIGHT RECORDER:   SUSPECT -" << static_cast<uint32_t>(frozenTick32 - e.tick) << " ms ("
+          << (count - k) << " calls before the freeze): " << fname << " on " << cls;
+        LogLine(o.str());
+        ++suspectsLogged;
+    }
+    if (suspectsLogged == 0)
+        LogLine("FLIGHT RECORDER:   no local-player-removal function (RemovePlayer, HandleControllerConnectionChange, "
+                "HandleLocalPlayerLeave, OnUserSignedOut...) went through ProcessEvent in this window.");
+
+    // busiest functions in the window
+    std::vector<std::pair<uint32_t, void*>> busiest;
+    busiest.reserve(counts.size());
+    for (const auto& kv : counts)
+        busiest.emplace_back(kv.second, kv.first);
+    std::sort(busiest.begin(), busiest.end(),
+              [](const std::pair<uint32_t, void*>& a, const std::pair<uint32_t, void*>& b) { return a.first > b.first; });
+    for (size_t i = 0; i < busiest.size() && i < 12; ++i)
+    {
+        std::ostringstream o;
+        o << "FLIGHT RECORDER:   busiest #" << (i + 1) << ": " << busiest[i].first << " x " << nameOf(busiest[i].second);
+        LogLine(o.str());
+    }
+
+    // the last 80 calls, oldest first
+    const uint32_t tail = count < 80 ? count : 80;
+    for (uint32_t k = count - tail; k < count; ++k)
+    {
+        const FrEntry e = g_frRing[(head - count + k) & (FR_SIZE - 1)];
+        if (!e.fn)
+            continue;
+        std::string cls = "?";
+        TryGetClassName(e.self, cls);
+        std::ostringstream o;
+        o << "FLIGHT RECORDER:   -" << static_cast<uint32_t>(frozenTick32 - e.tick) << " ms  " << nameOf(e.fn)
+          << "  <- " << cls;
+        LogLine(o.str());
+    }
+
+    g_frLastDumpMs.store(GetTickCount64(), std::memory_order_relaxed);
+    g_frFrozen.store(false, std::memory_order_release);   // recording resumes
 }
 
 static void InstallCrashGuard()
@@ -3044,14 +3280,21 @@ static void InstallCrashGuard()
         return;
 
     uintptr_t found[GUARD_MAX_SITES];
+    int foundRule[GUARD_MAX_SITES];
     int total = 0;
-    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections && total < GUARD_MAX_SITES; ++i, ++sec)
+    for (int ruleIdx = 0; ruleIdx < kGuardRuleCount; ++ruleIdx)
     {
-        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE))
-            continue;
-        total += static_cast<int>(ScanRegionSafe(base + sec->VirtualAddress, sec->Misc.VirtualSize,
-                                                 found + total, GUARD_MAX_SITES - total));
+        PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections && total < GUARD_MAX_SITES; ++i, ++sec)
+        {
+            if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE))
+                continue;
+            const int before = total;
+            total += static_cast<int>(ScanRegionSafe(ruleIdx, base + sec->VirtualAddress, sec->Misc.VirtualSize,
+                                                     found + total, GUARD_MAX_SITES - total));
+            for (int k = before; k < total; ++k)
+                foundRule[k] = ruleIdx;
+        }
     }
 
     if (total == 0)
@@ -3062,8 +3305,10 @@ static void InstallCrashGuard()
     for (int i = 0; i < total; ++i)
     {
         g_guardSites[i].store(found[i], std::memory_order_relaxed);
+        g_guardSiteRule[i].store(foundRule[i], std::memory_order_relaxed);
         std::ostringstream o;
-        o << "CRASH GUARD: armed at Dungeons image + 0x" << std::hex << (found[i] - base);
+        o << "CRASH GUARD: armed at Dungeons image + 0x" << std::hex << (found[i] - base) << std::dec
+          << " (rule " << foundRule[i] << ": " << kGuardRules[foundRule[i]].name << ")";
         LogLine(o.str());
     }
     g_guardSiteCount.store(total, std::memory_order_release);
@@ -3110,12 +3355,15 @@ static void VoidControllerThread()
                 std::ostringstream o;
                 o << "CRASH GUARD: recovered " << (hits - guardLogged) << " null-pointer read(s) at image + 0x"
                   << std::hex << (g_guardLastRip.load() - g_guardBase.load()) << std::dec
+                  << " (rule " << g_guardLastRule.load() << ")"
                   << " - game kept running. total=" << hits << ", in-level="
                   << (nowG - g_lastWorldChange.load()) / 60000.0 << " min, up="
                   << (nowG - g_dllStartTick.load()) / 60000.0 << " min, world=0x" << std::hex << g_lastSeenWorld.load();
                 LogLine(o.str());
                 guardLogged = hits;
             }
+            if (g_frFrozen.load(std::memory_order_acquire))
+                DumpFlightRecorder();   // the VEH froze the flight recorder at the first hit of an episode
         }
 
         const bool silent = EvaluateSilence();   // drives settle / deadman / GWorld watch
@@ -3208,7 +3456,7 @@ static void WaitForEngineBoot()
 void SetupHookThread()
 {
     LogLine("=== SetupHookThread starting (new session) ===");
-    LogLine("BUILD: silence + safety patch, launch-parity guard v1 + boot-wait v2 + void controller v3 (soft/hard void during transitions)");
+    LogLine("BUILD: silence + safety patch, launch-parity guard v1 + boot-wait v2 + void controller v3 (soft/hard void during transitions) + crash guard rules (tick + null-this) + flight recorder v1 (black-screen investigation) + Eye of Ender pickup blocking");
     struct SetupDone { ~SetupDone() { g_hookInstalled.store(true); } } setupDone;   // every exit path, incl. early returns
     // Small delay so classification/hooking doesn't start before the game's
     // own early init has had a chance to settle.
