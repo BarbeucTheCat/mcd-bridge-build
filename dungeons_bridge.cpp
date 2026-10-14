@@ -2169,6 +2169,136 @@ static void CaptureMissionOutcomeEvent(void* self, const std::string& triggerNam
 // inside a plain __try block, rather than annotating hkProcessEvent in place.
 // blockedOut is an out-param since __except's filter can't see local
 // variables declared inside the __try'd call in the caller's scope.
+// ---- Level gate (refuse a locked mission at the camp instead of killing the player inside it) -----------
+// UMissionSelectorComponent (SDK, Dungeons_classes.hpp):
+//   bool TryStartMissionSelection(APlayerCharacter*, const FMissionSelection&)
+//        params: +0x00 player, +0x08 FMissionSelection{ELevelNames levelName at +0x08}, ReturnValue at +0x10
+//   bool TryContinueMission(APlayerCharacter*, ELevelNames)
+//        params: +0x00 player, +0x08 levelName, ReturnValue at +0x09
+// Setting ReturnValue = false and swallowing the call = "the game refused to start that mission".
+// ServerRequestLevel / ServerAccept / ServerReject / TravelToMission / ClientLevelRequested are TRACE ONLY
+// (they carry no ELevelNames; the request's map name sits in ALobbyActor::mRequest.LevelSettings).
+// IMPORTANT: this only works if the game calls these through ProcessEvent. Both are native BlueprintCallable
+// functions; if the UI calls them directly the trace below will simply never show them - see the
+// "LEVEL GATE" lines in the debug log after one test in the camp.
+// Mode 0 = trace only, 1 = deny the levels sent by "set_level_gate <mode> <id,id,...>".
+static std::atomic<int> g_levelGateMode{ 0 };
+static std::atomic<uint8_t> g_lockedLevel[256];
+static std::atomic<uint64_t> g_levelGateDenied{ 0 };
+static std::mutex g_gateFnMutex;
+static std::unordered_map<void*, int>& GateFnCache()   // lazy: nothing allocated at DLL load
+{
+    static std::unordered_map<void*, int> m;
+    return m;
+}
+enum GateFn { GF_NONE = 0, GF_TRY_START = 1, GF_TRY_CONTINUE = 2, GF_REQUEST = 3, GF_ACCEPT = 4,
+              GF_REJECT = 5, GF_TRAVEL = 6, GF_CLIENT_REQUESTED = 7 };
+static const char* const kGateFnNames[] = { "", "TryStartMissionSelection", "TryContinueMission", "ServerRequestLevel",
+                                            "ServerAccept", "ServerReject", "TravelToMission", "ClientLevelRequested" };
+
+static int ClassifyGateFunction(void* function)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_gateFnMutex);
+        auto it = GateFnCache().find(function);
+        if (it != GateFnCache().end())
+            return it->second;
+    }
+    std::string name;
+    if (!TryGetObjectName(function, name))
+        return GF_NONE;   // transient failure: do not cache
+    int kind = GF_NONE;
+    for (int k = 1; k <= GF_CLIENT_REQUESTED; ++k)
+        if (name == kGateFnNames[k]) { kind = k; break; }
+    std::lock_guard<std::mutex> lock(g_gateFnMutex);
+    GateFnCache()[function] = kind;
+    return kind;
+}
+
+// POD-only helpers (a __try block cannot live in a function that has C++ objects needing unwinding).
+static bool GateReadByte(uintptr_t addr, uint8_t& out)
+{
+    __try { out = *reinterpret_cast<const uint8_t*>(addr); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool GateWriteByte(uintptr_t addr, uint8_t v)
+{
+    __try { *reinterpret_cast<uint8_t*>(addr) = v; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool GateReadPtr(uintptr_t addr, uintptr_t& out)
+{
+    __try { out = *reinterpret_cast<const uintptr_t*>(addr); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// FString = { wchar_t* Data; int32 Num; int32 Max } at addr.
+static bool GateReadWideFString(uintptr_t addr, wchar_t* buf, int cap, int& len)
+{
+    __try
+    {
+        const wchar_t* data = *reinterpret_cast<const wchar_t* const*>(addr);
+        int32_t num = *reinterpret_cast<const int32_t*>(addr + 8);
+        if (!data || num <= 0 || num >= cap) return false;
+        for (int i = 0; i < num; ++i) buf[i] = data[i];
+        buf[num] = 0;
+        len = num;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static std::string GateFString(uintptr_t addr)
+{
+    wchar_t buf[512];
+    int len = 0;
+    if (!GateReadWideFString(addr, buf, 512, len))
+        return "<unreadable>";
+    int n = WideCharToMultiByte(CP_UTF8, 0, buf, len, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return "<unreadable>";
+    std::string r(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, buf, len, &r[0], n, nullptr, nullptr);
+    while (!r.empty() && r.back() == '\0') r.pop_back();
+    return r;
+}
+
+static void GateHandle(void* self, void* params, int kind, bool* blocked)
+{
+    std::string cls;
+    if (!TryGetClassName(self, cls) || cls.find("MissionSelectorComponent") == std::string::npos)
+        return;
+    const int mode = g_levelGateMode.load(std::memory_order_relaxed);
+    const std::string fname = kGateFnNames[kind];
+
+    if (kind == GF_TRY_START || kind == GF_TRY_CONTINUE)
+    {
+        uint8_t id = 0;
+        if (!params || !GateReadByte(reinterpret_cast<uintptr_t>(params) + 0x08, id))
+            return;
+        const bool locked = mode >= 1 && g_lockedLevel[id].load(std::memory_order_relaxed) != 0;
+        LogLine("LEVEL GATE: " + fname + " level id " + std::to_string(id) +
+                (locked ? " -> DENIED" : " -> allowed") + " (gate " + (mode >= 1 ? "on" : "off") + ")");
+        if (locked)
+        {
+            GateWriteByte(reinterpret_cast<uintptr_t>(params) + (kind == GF_TRY_START ? 0x10 : 0x09), 0);   // ReturnValue = false
+            *blocked = true;
+            g_levelGateDenied.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+
+    // Trace only: what the lobby actor says the pending request is (names to build the next, denying hook).
+    std::string line = "LEVEL GATE TRACE: " + fname;
+    uintptr_t lobby = 0;
+    if (GateReadPtr(reinterpret_cast<uintptr_t>(self) + 0x128, lobby) && lobby)   // mLobbyActor
+    {
+        // ALobbyActor::mRequest at 0x370; FLevelRequest::LevelSettings at +0x18; unrealMapName +0x1A0, levelFilename +0x1B0
+        line += " | unrealMapName=" + GateFString(lobby + 0x370 + 0x18 + 0x1A0) +
+                " | levelFilename=" + GateFString(lobby + 0x370 + 0x18 + 0x1B0);
+        uint8_t reqLevel = 0;
+        (void)reqLevel;
+    }
+    LogLine(line);
+}
+
 void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blockedOut)
 {
     // Services queued CALL/CALLDATA requests (see HandleCall/HandleCallData)
@@ -2347,6 +2477,12 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
                     LogLine("SECRET TRACE (after): " + fname);
             }
         }
+    }
+
+    {
+        const int gateKind = ClassifyGateFunction(function);
+        if (gateKind != GF_NONE)
+            GateHandle(self, params, gateKind, &blocked);
     }
 
     // Currency widget cross-check (see the block above g_currencyPtr's
@@ -2689,6 +2825,37 @@ std::string HandleRequest(const std::string& request)
         }
         return out.str();
     }
+
+    if (request.rfind("set_level_gate ", 0) == 0)
+    {
+        // "set_level_gate <mode> <id,id,...>": mode 0 = trace only, 1 = deny; ids are ELevelNames values (1..255).
+        std::string body = request.substr(std::string("set_level_gate ").size());
+        int mode = body.empty() ? 0 : (body[0] - '0');
+        if (mode < 0 || mode > 1) mode = 0;
+        for (int i = 0; i < 256; ++i) g_lockedLevel[i].store(0, std::memory_order_relaxed);
+        int count = 0;
+        size_t sp = body.find(' ');
+        if (sp != std::string::npos)
+        {
+            std::string csv = body.substr(sp + 1);
+            size_t pos = 0;
+            while (pos < csv.size())
+            {
+                size_t comma = csv.find(',', pos);
+                std::string tok = csv.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                int id = atoi(tok.c_str());
+                if (id >= 1 && id <= 255) { g_lockedLevel[id].store(1, std::memory_order_relaxed); ++count; }
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+        }
+        g_levelGateMode.store(mode, std::memory_order_relaxed);
+        LogLine("set_level_gate: mode " + std::to_string(mode) + ", " + std::to_string(count) + " level id(s) refused");
+        return "OK";
+    }
+
+    if (request == "get_level_gate")
+        return std::to_string(g_levelGateMode.load()) + "," + std::to_string(g_levelGateDenied.load());
 
     if (request.rfind("set_secret_block ", 0) == 0)
     {
@@ -3456,7 +3623,7 @@ static void WaitForEngineBoot()
 void SetupHookThread()
 {
     LogLine("=== SetupHookThread starting (new session) ===");
-    LogLine("BUILD: silence + safety patch, launch-parity guard v1 + boot-wait v2 + void controller v3 (soft/hard void during transitions) + crash guard rules (tick + null-this) + flight recorder v1 (black-screen investigation) + Eye of Ender pickup blocking");
+    LogLine("BUILD: silence + safety patch, launch-parity guard v1 + boot-wait v2 + void controller v3 (soft/hard void during transitions) + crash guard rules (tick + null-this) + flight recorder v1 (black-screen investigation) + Eye of Ender pickup blocking + level gate v0 (trace + TryStart/TryContinue deny)");
     struct SetupDone { ~SetupDone() { g_hookInstalled.store(true); } } setupDone;   // every exit path, incl. early returns
     // Small delay so classification/hooking doesn't start before the game's
     // own early init has had a chance to settle.
