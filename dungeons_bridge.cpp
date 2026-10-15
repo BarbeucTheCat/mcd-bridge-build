@@ -1087,22 +1087,31 @@ static std::condition_variable g_resultCv;
 // Uses the comma-operator trick in the filter expression to actually
 // capture the exception code (GetExceptionCode() is only valid inside
 // the filter expression itself, not the __except body).
+// Thread id that is currently inside one of OUR OWN CALLDATA calls (0 = none). The ProcessEvent address we call
+// is the same one the hook sits on, so our own call re-enters hkProcessEvent on this thread; features that block
+// a game function (merchant unlock blocking) must let our own calls through, so they compare against this.
+static std::atomic<DWORD> g_ownCallThreadId{ 0 };
+
 static bool TryProcessEventCall(uintptr_t objectAddr, uintptr_t functionAddr, uint8_t* parms, DWORD& outExceptionCode)
 {
     DWORD code = 0;
+    const DWORD previousOwner = g_ownCallThreadId.exchange(GetCurrentThreadId(), std::memory_order_relaxed);
     __try
     {
         ProcessEventFn pe = GetProcessEventFn();
         if (!pe)
         {
             outExceptionCode = 0xE0000001;   // private code: no ProcessEvent RVA for this build
+            g_ownCallThreadId.store(previousOwner, std::memory_order_relaxed);
             return false;
         }
         pe(reinterpret_cast<void*>(objectAddr), reinterpret_cast<void*>(functionAddr), parms);
+        g_ownCallThreadId.store(previousOwner, std::memory_order_relaxed);
         return true;
     }
     __except ((code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
     {
+        g_ownCallThreadId.store(previousOwner, std::memory_order_relaxed);
         outExceptionCode = code;
         return false;
     }
@@ -1784,6 +1793,110 @@ static void SecretTraceDumpRing()
     g_secretTraceUntil.store(GetTickCount64() + 3000, std::memory_order_relaxed);
 }
 
+// ---- Merchant (captured villager) unlock: capture + optional blocking (seed option villager_checks) ----
+// Freeing a captured villager unlocks that merchant in the camp through UMerchantsUtil::UnlockMerchantForAllLocalPlayers
+// (static, params: WorldContext @0x00, TSubclassOf<UMerchantDef> Def @0x08) and/or APlayerCharacter::ClientUnlockMerchant
+// (param: Def @0x00) - names from the Dumper-7 SDK, not yet confirmed at runtime: the first time one of them fires
+// the debug log says so. Every call that is NOT one of our own (see g_ownCallThreadId) is queued for the Python
+// client (get_merchant_events), which turns it into an Archipelago check. With "set_block_merchants 1" the call is
+// also swallowed, so the merchant only unlocks when the matching Archipelago item arrives (the client then calls
+// UnlockMerchantForAllLocalPlayers itself, which is let through because it is one of our own calls).
+// Blocking is limited to merchant definitions whose class name contains one of the tokens the client sent along
+// with "set_block_merchants 1 <token,token,...>" (never the Tower merchants): the camp merchants that are NOT
+// captured villagers (Enchanter, Piglin... and anything the client does not know) keep unlocking normally.
+// DEFAULT OFF: with the flag off the call still runs normally and is only reported.
+struct MerchantUnlockEvent
+{
+    uint64_t defAddr;
+    std::string defName;    // name of the UClass passed as the merchant definition
+    std::string funcName;   // which UFunction fired
+};
+
+static std::atomic<bool> g_blockMerchantUnlock{ false };
+static std::mutex g_merchantTokensMutex;
+static std::vector<std::string> g_merchantBlockTokens;      // lowercase fragments of the merchant definition class names to block
+static std::mutex g_merchantEventsMutex;
+static std::vector<MerchantUnlockEvent> g_merchantEvents;   // drained by the pipe thread via get_merchant_events
+
+static std::mutex g_merchantFnMutex;
+static std::unordered_map<void*, int> g_merchantFnKind;     // function -> 0 not a merchant unlock, 1 ForAllLocalPlayers, 2 ClientUnlockMerchant
+
+static int ClassifyMerchantUnlockFunction(void* function)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_merchantFnMutex);
+        auto it = g_merchantFnKind.find(function);
+        if (it != g_merchantFnKind.end())
+            return it->second;
+    }
+    std::string name;
+    const bool resolved = TryGetObjectName(function, name);
+    int kind = 0;
+    if (resolved)
+    {
+        if (name == "UnlockMerchantForAllLocalPlayers")
+            kind = 1;
+        else if (name == "ClientUnlockMerchant")
+            kind = 2;
+    }
+    if (kind != 0 || ShouldCacheNegative(function, resolved))
+    {
+        std::lock_guard<std::mutex> lock(g_merchantFnMutex);
+        g_merchantFnKind[function] = kind;
+        if (kind != 0)
+            LogLine("Classified merchant unlock function: " + name);
+    }
+    return kind;
+}
+
+static bool MerchantDefIsBlockable(const std::string& defName)
+{
+    const std::string lower = ToLowerCopy(defName);
+    if (lower.find("tower") != std::string::npos)
+        return false;
+    std::lock_guard<std::mutex> lock(g_merchantTokensMutex);
+    for (const std::string& token : g_merchantBlockTokens)
+        if (!token.empty() && lower.find(token) != std::string::npos)
+            return true;
+    return false;
+}
+
+// Queues the event and returns the merchant definition's class name through outDefName.
+static void CaptureMerchantUnlockEvent(void* params, int kind, std::string& outDefName)
+{
+    if (!params)
+        return;
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(params);
+    const uint64_t defAddr = *reinterpret_cast<const uint64_t*>(base + (kind == 1 ? 0x08 : 0x00));
+    MerchantUnlockEvent evt;
+    evt.defAddr = defAddr;
+    evt.funcName = (kind == 1) ? "UnlockMerchantForAllLocalPlayers" : "ClientUnlockMerchant";
+    evt.defName = "?";
+    if (defAddr)
+        TryGetObjectName(reinterpret_cast<void*>(defAddr), evt.defName);
+    LogLine("MERCHANT UNLOCK seen: " + evt.funcName + " def=" + evt.defName);
+    outDefName = evt.defName;
+    std::lock_guard<std::mutex> lock(g_merchantEventsMutex);
+    if (g_merchantEvents.size() < 256)
+        g_merchantEvents.push_back(std::move(evt));
+}
+
+// Diagnostic only (no behaviour): which functions the game runs on a captured villager / camp villager actor. The
+// interact-family hook already computed the class name, so this costs nothing for other actors. Rate limited.
+static void LogVillagerInteract(void* function, const std::string& className)
+{
+    if (className.find("CapturedVillager") == std::string::npos && className.find("LobbyVillager") == std::string::npos)
+        return;
+    static std::atomic<ULONGLONG> lastMs{ 0 };
+    const ULONGLONG nowMs = GetTickCount64();
+    if (nowMs - lastMs.load(std::memory_order_relaxed) < 1000)
+        return;
+    lastMs.store(nowMs, std::memory_order_relaxed);
+    std::string fname = "?";
+    TryGetObjectName(function, fname);
+    LogLine("VILLAGER interact: " + fname + " on " + className);
+}
+
 static std::mutex g_secretEventsMutex;
 static std::vector<SecretFoundEvent> g_secretEvents;   // drained by the pipe thread via get_secret_events
 
@@ -2354,6 +2467,7 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
         std::string className;
         if (TryGetClassName(self, className))
         {
+            LogVillagerInteract(function, className);
             int tier = ClassifyPickupTier(className);
             int unlocked = g_pickupUnlockTier.load(std::memory_order_relaxed);
             if (tier > 0 && tier > unlocked)
@@ -2383,6 +2497,22 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
                 std::string eyeClassName = "?";
                 TryGetClassName(self, eyeClassName);
                 LogLine("BLOCKED Eye of Ender pickup (the Eye is a check now): " + eyeClassName);
+            }
+        }
+    }
+
+    // Merchant unlock (captured villager freed): report it, and swallow it when Python enabled blocking.
+    // Our own CALLDATA calls pass through here too - they are never reported and never blocked.
+    {
+        const int merchantKind = ClassifyMerchantUnlockFunction(function);
+        if (merchantKind != 0 && g_ownCallThreadId.load(std::memory_order_relaxed) != GetCurrentThreadId())
+        {
+            std::string merchantDefName;
+            CaptureMerchantUnlockEvent(params, merchantKind, merchantDefName);
+            if (g_blockMerchantUnlock.load(std::memory_order_relaxed) && MerchantDefIsBlockable(merchantDefName))
+            {
+                blocked = true;
+                LogLine("BLOCKED merchant unlock (the villager is a check now): " + merchantDefName);
             }
         }
     }
@@ -2901,6 +3031,56 @@ std::string HandleRequest(const std::string& request)
         {
             return "ERROR: invalid tier value";
         }
+    }
+
+    if (request.rfind("set_block_merchants ", 0) == 0)
+    {
+        // "set_block_merchants 1 villagemerchant,mysterymerchant" / "set_block_merchants 0"
+        const std::string body = request.substr(std::string("set_block_merchants ").size());
+        const bool enable = !body.empty() && body[0] == '1';
+        std::vector<std::string> tokens;
+        if (enable && body.size() > 2)
+        {
+            std::string current;
+            for (size_t i = 2; i <= body.size(); ++i)
+            {
+                if (i == body.size() || body[i] == ',')
+                {
+                    if (!current.empty())
+                        tokens.push_back(ToLowerCopy(current));
+                    current.clear();
+                }
+                else if (body[i] != ' ')
+                    current.push_back(body[i]);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_merchantTokensMutex);
+            g_merchantBlockTokens = tokens;
+        }
+        g_blockMerchantUnlock.store(enable, std::memory_order_relaxed);
+        LogLine(std::string("set_block_merchants: merchant unlock blocking ") + (enable ? "ON" : "OFF") +
+                " (" + std::to_string(tokens.size()) + " name fragment(s))");
+        return "OK";
+    }
+
+    if (request == "get_block_merchants")
+    {
+        return g_blockMerchantUnlock.load(std::memory_order_relaxed) ? "BLOCK_MERCHANTS:1" : "BLOCK_MERCHANTS:0";
+    }
+
+    if (request == "get_merchant_events")
+    {
+        std::vector<MerchantUnlockEvent> drained;
+        {
+            std::lock_guard<std::mutex> lock(g_merchantEventsMutex);
+            std::swap(drained, g_merchantEvents);
+        }
+        std::ostringstream out;
+        out << "EVENTS:" << std::dec << drained.size();
+        for (const auto& e : drained)
+            out << "|" << std::hex << e.defAddr << std::dec << "," << e.defName << "," << e.funcName;
+        return out.str();
     }
 
     if (request.rfind("set_block_eyes ", 0) == 0)
