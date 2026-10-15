@@ -548,6 +548,25 @@ static inline void FlightRecord(void* self, void* function)
     e.tick = GetTickCount();
 }
 
+// Recent pipe commands from the client (everything except the polled "get_*" reads). The flight recorder dump
+// prints them with their age, so a black screen / guard storm can be matched with what the client had just asked
+// the game to do (grants, void mode, level gate ...). Diagnostic only: a torn read of a slot is harmless.
+struct CmdNote { ULONGLONG ms; char text[80]; };
+static CmdNote                g_cmdRing[32];         // static storage = zero-initialised
+static std::atomic<uint32_t>  g_cmdHead{ 0 };
+static void NoteCommand(const std::string& request)
+{
+    if (request.compare(0, 4, "get_") == 0 || request == "hook_state")
+        return;
+    const uint32_t i = g_cmdHead.fetch_add(1, std::memory_order_relaxed) & 31;
+    CmdNote& n = g_cmdRing[i];
+    n.ms = GetTickCount64();
+    size_t len = request.size() < sizeof(n.text) - 1 ? request.size() : sizeof(n.text) - 1;
+    for (size_t k = 0; k < len; ++k)
+        n.text[k] = (request[k] == '\n' || request[k] == '\r') ? ' ' : request[k];
+    n.text[len] = 0;
+}
+
 static void DumpFlightRecorder();   // defined with the crash guard, below
 
 enum VoidAction { VOID_NONE = 0, VOID_UNPATCH = 1, VOID_REPATCH = 2 };
@@ -2715,6 +2734,7 @@ static uintptr_t FindPattern(const uint8_t* pattern, size_t patternLen)
 
 std::string HandleRequest(const std::string& request)
 {
+    NoteCommand(request);
     if (request == "get_currency_ptr")
     {
         // hkCurrencyGetter/g_currencyPtr permanently removed - confirmed
@@ -3422,6 +3442,23 @@ static void DumpFlightRecorder()
         LogLine(o.str());
     }
 
+    // what the client had asked for just before (oldest first), aged against the moment the recorder froze
+    {
+        const ULONGLONG frozenMs = g_frFrozenTick.load(std::memory_order_relaxed);
+        const uint32_t h = g_cmdHead.load(std::memory_order_relaxed);
+        const uint32_t cnt = h < 32 ? h : 32;
+        LogLine("FLIGHT RECORDER: last " + std::to_string(cnt) + " client command(s) (no get_* polls), oldest first:");
+        for (uint32_t k = 0; k < cnt; ++k)
+        {
+            const CmdNote n = g_cmdRing[(h - cnt + k) & 31];
+            if (!n.ms)
+                continue;
+            const long long age = static_cast<long long>(frozenMs) - static_cast<long long>(n.ms);
+            LogLine("FLIGHT RECORDER:   cmd " + (age >= 0 ? "-" + std::to_string(age) : "+" + std::to_string(-age)) +
+                    " ms  " + std::string(n.text));
+        }
+    }
+
     g_frLastDumpMs.store(GetTickCount64(), std::memory_order_relaxed);
     g_frFrozen.store(false, std::memory_order_release);   // recording resumes
 }
@@ -3623,7 +3660,7 @@ static void WaitForEngineBoot()
 void SetupHookThread()
 {
     LogLine("=== SetupHookThread starting (new session) ===");
-    LogLine("BUILD: silence + safety patch, launch-parity guard v1 + boot-wait v2 + void controller v3 (soft/hard void during transitions) + crash guard rules (tick + null-this) + flight recorder v1 (black-screen investigation) + Eye of Ender pickup blocking + level gate v0 (trace + TryStart/TryContinue deny)");
+    LogLine("BUILD: silence + safety patch, launch-parity guard v1 + boot-wait v2 + void controller v3 (soft/hard void during transitions) + crash guard rules (tick + null-this) + flight recorder v1 (black-screen investigation) + Eye of Ender pickup blocking + level gate v0 (trace + TryStart/TryContinue deny) + client command trace in the flight recorder");
     struct SetupDone { ~SetupDone() { g_hookInstalled.store(true); } } setupDone;   // every exit path, incl. early returns
     // Small delay so classification/hooking doesn't start before the game's
     // own early init has had a chance to settle.
