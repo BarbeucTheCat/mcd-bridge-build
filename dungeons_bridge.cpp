@@ -28,9 +28,13 @@
 //        /link d3d11.lib dxgi.lib <minhook>\build\libMinHook.x64.lib ^
 //        /OUT:dungeons_bridge.dll
 //
+// Add /MAP:dungeons_bridge.map to the link options (before /OUT) and run `python finish_build.py` after every build:
+// the map lets /crash turn dungeons_bridge.dll+0x... into function names (crash reports AND freeze reports).
+//
 // Both from "x64 Native Tools Command Prompt for VS 2022".
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <string>
@@ -49,6 +53,8 @@
 #include <sstream>
 #include <functional>
 #include <atomic>
+#include <cstdarg>
+#include <cstring>
 
 #include "MinHook.h"
 
@@ -189,6 +195,101 @@ static void LogLine(const std::string& line)
 static uintptr_t GetImageBase()
 {
     return reinterpret_cast<uintptr_t>(GetModuleHandle(0));
+}
+
+// ---- Build identity + breadcrumbs (crash reporting, early part) ---------------------------------------------------
+// kBuildMarker is searched for in the DLL FILE by the tools (tools/finish_build.py, crash_diag.py) to tell which build
+// a crash report or a .map file belongs to. kFeatures is what the client checks at attach time (get_build_info), so
+// an old DLL next to a newer client is reported immediately instead of failing in a confusing way.
+static const char kBuildMarker[] = "DBBUILD:" __DATE__ " " __TIME__;
+static const char* const kBuildId = kBuildMarker + 8;
+static const char kFeatures[] = "merchants,crashreport,owncall,crumbs,health";
+
+// Breadcrumbs: a small lock-free ring of "what the DLL itself was doing" (pipe commands, our own game calls,
+// merchant events, hook state changes...). Allocation-free so it can be written - and read by the crash reporter -
+// from any thread, even inside an exception handler. Torn entries are possible and harmless.
+struct Crumb { ULONGLONG tick; DWORD tid; char kind[12]; char text[76]; uint64_t a; uint64_t b; };
+static const uint32_t CRUMB_SIZE = 256;   // power of two
+static Crumb g_crumbs[CRUMB_SIZE];
+static std::atomic<uint32_t> g_crumbHead{ 0 };
+
+static void CrumbAdd(const char* kind, const char* text, uint64_t a = 0, uint64_t b = 0)
+{
+    Crumb& c = g_crumbs[g_crumbHead.fetch_add(1, std::memory_order_relaxed) & (CRUMB_SIZE - 1)];
+    c.tick = GetTickCount64();
+    c.tid = GetCurrentThreadId();
+    strncpy_s(c.kind, sizeof(c.kind), kind ? kind : "", _TRUNCATE);
+    strncpy_s(c.text, sizeof(c.text), text ? text : "", _TRUNCATE);
+    c.a = a;
+    c.b = b;
+}
+
+static std::atomic<DWORD> g_hookThreadId{ 0 };          // thread that runs hkProcessEvent (the game thread)
+static std::atomic<uint64_t> g_curCallObj{ 0 };         // our own CALLDATA call in progress (0 = none)
+static std::atomic<uint64_t> g_curCallFunc{ 0 };
+static std::atomic<uint64_t> g_lastFaultAddr{ 0 };      // address of the last fault caught by one of OUR __try blocks
+static void DescribeAddress(uint64_t addr, char* out, size_t n);   // "module+0xRVA", defined with the crash reporter
+
+// ---- Health watch (freezes, slow calls, false positives): shared state -------------------------------------------
+// Everything that is not a crash but still ruins a session. The watchdog (HealthSample, run by the VoidController
+// thread) turns it into events the client drains with get_health_events; live numbers come from get_health.
+struct HealthEvent { ULONGLONG tick; char kind[16]; char text[140]; uint64_t value; };
+static std::mutex g_healthMutex;
+static std::vector<HealthEvent> g_healthEvents;
+static void HealthEventAdd(const char* kind, const char* text, uint64_t value = 0)   // normal context only (locks, may allocate)
+{
+    CrumbAdd("HEALTH", kind, value);
+    HealthEvent e;
+    memset(&e, 0, sizeof(e));
+    e.tick = GetTickCount64();
+    strncpy_s(e.kind, sizeof(e.kind), kind ? kind : "", _TRUNCATE);
+    strncpy_s(e.text, sizeof(e.text), text ? text : "", _TRUNCATE);
+    e.value = value;
+    std::lock_guard<std::mutex> lock(g_healthMutex);
+    if (g_healthEvents.size() < 64)
+        g_healthEvents.push_back(e);
+}
+// How many game calls each blocking feature swallowed (a false positive shows as a count that keeps climbing).
+static std::atomic<uint32_t> g_blockedPickup{ 0 };
+static std::atomic<uint32_t> g_blockedEye{ 0 };
+static std::atomic<uint32_t> g_blockedSecret{ 0 };
+static std::atomic<uint32_t> g_blockedMerchant{ 0 };
+// Our own game calls: how long the current one has been running, how many were slow.
+static std::atomic<ULONGLONG> g_curCallStartMs{ 0 };
+static char g_curCallName[72];
+static std::atomic<uint32_t> g_slowCalls{ 0 };
+static std::atomic<uint32_t> g_maxCallMs{ 0 };
+static std::atomic<bool> g_stalled{ false };
+static std::atomic<ULONGLONG> g_lastPeChangeMs{ 0 };
+static void WriteHangSample(DWORD gameTid, ULONGLONG idleMs, bool foreground, int sampleNo);   // defined with the freeze watchdog
+static bool GameWindowIsForeground();
+
+// Own function because MSVC refuses __try in a function that has C++ objects needing unwinding (HandleRequest has).
+static void CrashSelfTestFault()
+{
+    __try
+    {
+        *reinterpret_cast<volatile int*>(0x10) = 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+}
+
+// The last `maxEntries` breadcrumbs, oldest first, one per line: "+<ms ago> tid=<n> KIND text a=0x.. b=0x..".
+static std::string CrumbsToString(uint32_t maxEntries)
+{
+    const uint32_t head = g_crumbHead.load(std::memory_order_relaxed);
+    const uint32_t count = std::min<uint32_t>(std::min<uint32_t>(head, CRUMB_SIZE), maxEntries);
+    const ULONGLONG now = GetTickCount64();
+    std::ostringstream out;
+    for (uint32_t k = 0; k < count; ++k)
+    {
+        const Crumb& c = g_crumbs[(head - count + k) & (CRUMB_SIZE - 1)];
+        out << "+" << (now >= c.tick ? now - c.tick : 0) << "ms tid=" << c.tid << " " << c.kind << " " << c.text
+            << " a=0x" << std::hex << c.a << " b=0x" << c.b << std::dec << "\n";
+    }
+    return out.str();
 }
 
 struct StoreOffsets
@@ -558,6 +659,7 @@ static void NoteCommand(const std::string& request)
 {
     if (request.compare(0, 4, "get_") == 0 || request == "hook_state")
         return;
+    CrumbAdd("PIPE", request.substr(0, 70).c_str());
     const uint32_t i = g_cmdHead.fetch_add(1, std::memory_order_relaxed) & 31;
     CmdNote& n = g_cmdRing[i];
     n.ms = GetTickCount64();
@@ -589,6 +691,7 @@ static void SilenceLogDirect(const char* what, uint64_t world, ULONGLONG ms)
 {
     std::ostringstream o;
     o << "HOOK " << what << " (world=0x" << std::hex << world << std::dec << ", " << ms << " ms)";
+    CrumbAdd("HOOK", what, world, ms);
     LogLine(o.str());
 }
 
@@ -1092,10 +1195,20 @@ static std::condition_variable g_resultCv;
 // a game function (merchant unlock blocking) must let our own calls through, so they compare against this.
 static std::atomic<DWORD> g_ownCallThreadId{ 0 };
 
+static LONG CaptureOwnFault(EXCEPTION_POINTERS* ep, DWORD* code)
+{
+    *code = ep->ExceptionRecord->ExceptionCode;
+    g_lastFaultAddr.store(reinterpret_cast<uint64_t>(ep->ExceptionRecord->ExceptionAddress), std::memory_order_relaxed);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 static bool TryProcessEventCall(uintptr_t objectAddr, uintptr_t functionAddr, uint8_t* parms, DWORD& outExceptionCode)
 {
     DWORD code = 0;
     const DWORD previousOwner = g_ownCallThreadId.exchange(GetCurrentThreadId(), std::memory_order_relaxed);
+    g_curCallObj.store(objectAddr, std::memory_order_relaxed);
+    g_curCallFunc.store(functionAddr, std::memory_order_relaxed);
+    g_curCallStartMs.store(GetTickCount64(), std::memory_order_relaxed);
     __try
     {
         ProcessEventFn pe = GetProcessEventFn();
@@ -1103,15 +1216,21 @@ static bool TryProcessEventCall(uintptr_t objectAddr, uintptr_t functionAddr, ui
         {
             outExceptionCode = 0xE0000001;   // private code: no ProcessEvent RVA for this build
             g_ownCallThreadId.store(previousOwner, std::memory_order_relaxed);
+            g_curCallObj.store(0, std::memory_order_relaxed);
+            g_curCallStartMs.store(0, std::memory_order_relaxed);
             return false;
         }
         pe(reinterpret_cast<void*>(objectAddr), reinterpret_cast<void*>(functionAddr), parms);
         g_ownCallThreadId.store(previousOwner, std::memory_order_relaxed);
+        g_curCallObj.store(0, std::memory_order_relaxed);
+        g_curCallStartMs.store(0, std::memory_order_relaxed);
         return true;
     }
-    __except ((code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
+    __except (CaptureOwnFault(GetExceptionInformation(), &code))
     {
         g_ownCallThreadId.store(previousOwner, std::memory_order_relaxed);
+        g_curCallObj.store(0, std::memory_order_relaxed);
+        g_curCallStartMs.store(0, std::memory_order_relaxed);
         outExceptionCode = code;
         return false;
     }
@@ -1160,7 +1279,33 @@ static void DrainPendingCalls()
         }
 
         DWORD exceptionCode = 0;
+        std::string callName = "?";
+        TryGetObjectName(reinterpret_cast<void*>(req->functionAddr), callName);
+        CrumbAdd("CALL", callName.c_str(), req->objectAddr, req->functionAddr);
+        strncpy_s(g_curCallName, sizeof(g_curCallName), callName.c_str(), _TRUNCATE);
+        const ULONGLONG callStartMs = GetTickCount64();
         bool ok = TryProcessEventCall(req->objectAddr, req->functionAddr, req->parms.data(), exceptionCode);
+        {
+            const uint32_t tookMs = static_cast<uint32_t>(GetTickCount64() - callStartMs);
+            if (tookMs > g_maxCallMs.load(std::memory_order_relaxed))
+                g_maxCallMs.store(tookMs, std::memory_order_relaxed);
+            if (tookMs >= 150)
+            {
+                g_slowCalls.fetch_add(1, std::memory_order_relaxed);
+                HealthEventAdd("SLOW_CALL", (callName + " took " + std::to_string(tookMs) + " ms on the game thread").c_str(), tookMs);
+            }
+        }
+        if (!ok)
+        {
+            char where[160];
+            DescribeAddress(g_lastFaultAddr.load(std::memory_order_relaxed), where, sizeof(where));
+            CrumbAdd("CALLFAULT", callName.c_str(), exceptionCode, g_lastFaultAddr.load(std::memory_order_relaxed));
+            std::ostringstream fault;
+            fault << "CALLDATA FAULT: " << callName << " code=0x" << std::hex << exceptionCode << std::dec
+                  << " at " << where << " (object 0x" << std::hex << req->objectAddr << std::dec
+                  << ", build " << kBuildId << ") - the game call was aborted, the game keeps running";
+            LogLine(fault.str());
+        }
 
         {
             std::lock_guard<std::mutex> lock(g_resultMutex);
@@ -1875,6 +2020,7 @@ static void CaptureMerchantUnlockEvent(void* params, int kind, std::string& outD
     if (defAddr)
         TryGetObjectName(reinterpret_cast<void*>(defAddr), evt.defName);
     LogLine("MERCHANT UNLOCK seen: " + evt.funcName + " def=" + evt.defName);
+    CrumbAdd("MERCHANT", evt.defName.c_str(), defAddr, kind);
     outDefName = evt.defName;
     std::lock_guard<std::mutex> lock(g_merchantEventsMutex);
     if (g_merchantEvents.size() < 256)
@@ -2453,7 +2599,10 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
 
     uint64_t callNum = g_processEventCallCount.fetch_add(1, std::memory_order_relaxed);
     if (callNum == 0)
+    {
+        g_hookThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
         LogLine("hkProcessEvent: first call received - hook is definitely firing.");
+    }
 
     bool blocked = false;
 
@@ -2473,6 +2622,7 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
             if (tier > 0 && tier > unlocked)
             {
                 blocked = true;
+                g_blockedPickup.fetch_add(1, std::memory_order_relaxed);
                 LogLine("BLOCKED pickup (tier " + std::to_string(tier) + " > unlocked " +
                          std::to_string(unlocked) + "): " + className);
             }
@@ -2488,6 +2638,7 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
         if (eyeCall)
         {
             blocked = true;
+            g_blockedEye.fetch_add(1, std::memory_order_relaxed);
             // A held interact key calls this every frame: log at most once per second.
             static std::atomic<ULONGLONG> lastEyeBlockLogMs{ 0 };
             const ULONGLONG nowMs = GetTickCount64();
@@ -2512,7 +2663,9 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
             if (g_blockMerchantUnlock.load(std::memory_order_relaxed) && MerchantDefIsBlockable(merchantDefName))
             {
                 blocked = true;
+                g_blockedMerchant.fetch_add(1, std::memory_order_relaxed);
                 LogLine("BLOCKED merchant unlock (the villager is a check now): " + merchantDefName);
+                CrumbAdd("BLOCK", merchantDefName.c_str());
             }
         }
     }
@@ -2594,12 +2747,14 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
             if (blockLevel >= 1)
             {
                 blocked = true;
+                g_blockedSecret.fetch_add(1, std::memory_order_relaxed);
                 LogLine("BLOCKED SecretFound/ExecuteSecretFound (sent to client as a check instead of unlocking the secret mission)");
             }
         }
         else if (blockLevel >= 2 && IsSecretHandlerFunction(function))
         {
             blocked = true;
+            g_blockedSecret.fetch_add(1, std::memory_order_relaxed);
             LogLine("BLOCKED OnSecretFoundRecieved handler (level 2)");
         }
         else if (IsSecretUnlockedPopupFunction(function))
@@ -3092,6 +3247,75 @@ std::string HandleRequest(const std::string& request)
         return "OK";
     }
 
+    if (request == "get_health")
+    {
+        const ULONGLONG now = GetTickCount64();
+        const ULONGLONG changed = g_lastPeChangeMs.load(std::memory_order_relaxed);
+        const ULONGLONG callStart = g_curCallStartMs.load(std::memory_order_relaxed);
+        std::ostringstream out;
+        out << "HEALTH:peIdleMs=" << (changed && now >= changed ? now - changed : 0)
+            << "|silent=" << (g_hookSilent.load(std::memory_order_relaxed) ? 1 : 0)
+            << "|stalled=" << (g_stalled.load(std::memory_order_relaxed) ? 1 : 0)
+            << "|ownCallMs=" << (callStart && now >= callStart ? now - callStart : 0)
+            << "|slowCalls=" << g_slowCalls.load(std::memory_order_relaxed)
+            << "|maxCallMs=" << g_maxCallMs.load(std::memory_order_relaxed)
+            << "|guardHits=" << g_guardHits.load(std::memory_order_relaxed)
+            << "|blockedPickup=" << g_blockedPickup.load(std::memory_order_relaxed)
+            << "|blockedEye=" << g_blockedEye.load(std::memory_order_relaxed)
+            << "|blockedSecret=" << g_blockedSecret.load(std::memory_order_relaxed)
+            << "|blockedMerchant=" << g_blockedMerchant.load(std::memory_order_relaxed)
+            << "|inLevelMs=" << (now - g_lastWorldChange.load(std::memory_order_relaxed));
+        return out.str();
+    }
+
+    if (request == "get_health_events")
+    {
+        std::vector<HealthEvent> drained;
+        {
+            std::lock_guard<std::mutex> lock(g_healthMutex);
+            std::swap(drained, g_healthEvents);
+        }
+        const ULONGLONG now = GetTickCount64();
+        std::ostringstream out;
+        out << "EVENTS:" << drained.size();
+        for (const HealthEvent& e : drained)
+        {
+            std::string text = e.text;
+            for (char& ch : text)
+                if (ch == ',' || ch == '|' || ch == '\n')
+                    ch = ';';
+            out << "|" << (now >= e.tick ? now - e.tick : 0) << "," << e.kind << "," << text << "," << e.value;
+        }
+        return out.str();
+    }
+
+    if (request == "health_selftest")
+    {
+        // Proves the freeze snapshot works WITHOUT a freeze: takes one hang sample of the game thread right now.
+        CrumbAdd("SELFTEST", "hang sample requested");
+        WriteHangSample(g_hookThreadId.load(std::memory_order_relaxed), 0, GameWindowIsForeground(), 0);
+        return "OK";
+    }
+
+    if (request == "get_build_info")
+    {
+        return std::string("BUILD:") + kBuildId + "|FEATURES:" + kFeatures;
+    }
+
+    if (request == "get_crumbs")
+    {
+        return "CRUMBS:\n" + CrumbsToString(60);
+    }
+
+    if (request == "crash_selftest")
+    {
+        // Proves the crash reporter works WITHOUT crashing anything: a deliberate, caught access violation on this
+        // (pipe) thread. A "CRASH REPORT" must show up in dungeons_bridge_crash.log; the game never notices.
+        CrumbAdd("SELFTEST", "deliberate caught access violation");
+        CrashSelfTestFault();
+        return "OK";
+    }
+
     if (request == "dump_recorder")
     {
         // On-demand flight recorder dump (e.g. right after a black screen with no guard hit): freezes the ring
@@ -3493,6 +3717,7 @@ static LONG CALLBACK CrashGuardVeh(PEXCEPTION_POINTERS info)
     g_guardLastRip.store(rip, std::memory_order_relaxed);
     g_guardLastRule.store(rule, std::memory_order_relaxed);
     g_guardHits.fetch_add(1, std::memory_order_relaxed);
+    CrumbAdd("GUARD", kGuardRules[rule].name, rip, static_cast<uint64_t>(rule));
 
     // First hit of an episode (nothing dumped for a minute): freeze the flight recorder so the calls that led up
     // to the lost player are kept. Atomics only - this runs inside the exception handler.
@@ -3643,6 +3868,446 @@ static void DumpFlightRecorder()
     g_frFrozen.store(false, std::memory_order_release);   // recording resumes
 }
 
+// ---- Crash reporter (late part) ---------------------------------------------------------------------------------
+// A vectored exception handler, registered LAST (after the crash guard, which gets first pick of the access violations
+// it knows how to patch), that writes a self-contained report to dungeons_bridge_crash.log for every serious
+// first-chance exception nobody patched: exception code, faulting address as module+offset, registers, a stack walk as
+// module+offset lines, whether it happened inside one of OUR protected game calls (and which), and the breadcrumbs.
+// It never changes the outcome (always CONTINUE_SEARCH): the game's own crash reporter / our __try blocks still run.
+// A "first-chance" report with the game still running afterwards was caught by somebody's __try - harmless; the LAST
+// report before the game dies is the culprit. Everything here is allocation- and lock-free (static buffers, raw
+// WriteFile), so it works even when the crash is a heap or lock problem.
+static HANDLE g_crashFile = INVALID_HANDLE_VALUE;
+static std::atomic<uint32_t> g_crashReports{ 0 };
+static std::atomic<long> g_inCrashReporter{ 0 };
+
+static void CrashPrintf(const char* fmt, ...)
+{
+    if (g_crashFile == INVALID_HANDLE_VALUE)
+        return;
+    char buf[640];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    if (n < 0)
+        n = static_cast<int>(strlen(buf));
+    DWORD written = 0;
+    WriteFile(g_crashFile, buf, static_cast<DWORD>(n), &written, nullptr);
+}
+
+static void DescribeAddress(uint64_t addr, char* out, size_t n)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if (addr == 0 || !VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) || !mbi.AllocationBase)
+    {
+        _snprintf_s(out, n, _TRUNCATE, "0x%llx (unmapped)", static_cast<unsigned long long>(addr));
+        return;
+    }
+    const char* name = "?";
+    char path[MAX_PATH];
+    if (mbi.AllocationBase == g_ownModule)
+        name = "dungeons_bridge.dll";
+    else if (mbi.Type == MEM_IMAGE && GetModuleFileNameA(reinterpret_cast<HMODULE>(mbi.AllocationBase), path, MAX_PATH))
+    {
+        const char* slash = strrchr(path, '\\');
+        name = slash ? slash + 1 : path;
+    }
+    else
+        name = (mbi.Type == MEM_PRIVATE) ? "(heap/private memory)" : "(mapped memory)";
+    _snprintf_s(out, n, _TRUNCATE, "%s+0x%llx", name,
+                static_cast<unsigned long long>(addr - reinterpret_cast<uint64_t>(mbi.AllocationBase)));
+}
+
+static const char* ExceptionName(DWORD code)
+{
+    switch (code)
+    {
+    case EXCEPTION_ACCESS_VIOLATION:      return "ACCESS_VIOLATION";
+    case EXCEPTION_IN_PAGE_ERROR:         return "IN_PAGE_ERROR";
+    case EXCEPTION_STACK_OVERFLOW:        return "STACK_OVERFLOW";
+    case EXCEPTION_ILLEGAL_INSTRUCTION:   return "ILLEGAL_INSTRUCTION";
+    case EXCEPTION_PRIV_INSTRUCTION:      return "PRIV_INSTRUCTION";
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:    return "INT_DIVIDE_BY_ZERO";
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED: return "ARRAY_BOUNDS_EXCEEDED";
+    case 0xC0000374:                      return "HEAP_CORRUPTION";
+    case 0xC0000409:                      return "FAIL_FAST (stack buffer overrun / abort)";
+    default:                              return "?";
+    }
+}
+
+static int WalkStack(CONTEXT ctx, uint64_t* frames, int maxFrames)
+{
+    int n = 0;
+    for (; n < maxFrames; ++n)
+    {
+        const DWORD64 pc = ctx.Rip;
+        if (!pc)
+            break;
+        frames[n] = pc;
+        DWORD64 imageBase = 0;
+        PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(pc, &imageBase, nullptr);
+        if (!fe)
+        {
+            ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);   // leaf function: the return address is on top of the stack
+            ctx.Rsp += 8;
+        }
+        else
+        {
+            PVOID handlerData = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, pc, fe, &ctx, &handlerData, &establisher, nullptr);
+        }
+        if (!ctx.Rsp)
+            break;
+    }
+    return n;
+}
+
+static void WriteCrashReport(PEXCEPTION_POINTERS info, uint32_t number)
+{
+    const EXCEPTION_RECORD* er = info->ExceptionRecord;
+    const CONTEXT* c = info->ContextRecord;
+    const DWORD tid = GetCurrentThreadId();
+    const bool ownCall = g_ownCallThreadId.load(std::memory_order_relaxed) == tid;
+    const bool stackOverflow = er->ExceptionCode == EXCEPTION_STACK_OVERFLOW;
+    char where[200];
+
+    CrashPrintf("\r\n==== CRASH REPORT #%u  build=%s  pid=%lu  uptime=%llus ====\r\n", number, kBuildId,
+                GetCurrentProcessId(), static_cast<unsigned long long>(GetTickCount64() / 1000));
+    CrashPrintf("exception 0x%08lX %s (first-chance: harmless if the game keeps running)\r\n",
+                er->ExceptionCode, ExceptionName(er->ExceptionCode));
+    if ((er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || er->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
+        er->NumberParameters >= 2)
+    {
+        const ULONG_PTR kind = er->ExceptionInformation[0];
+        CrashPrintf("access: %s of address 0x%llx\r\n", kind == 0 ? "READ" : kind == 1 ? "WRITE" : "EXECUTE (DEP)",
+                    static_cast<unsigned long long>(er->ExceptionInformation[1]));
+    }
+    DescribeAddress(reinterpret_cast<uint64_t>(er->ExceptionAddress), where, sizeof(where));
+    CrashPrintf("at: %s\r\n", where);
+    CrashPrintf("thread: %lu (%s)%s\r\n", tid,
+                tid == g_hookThreadId.load(std::memory_order_relaxed) ? "game/hook thread" : "other thread",
+                ownCall ? "  ** inside OUR protected game call - caught by our __try, the game continues **" : "");
+    if (ownCall && g_curCallObj.load(std::memory_order_relaxed))
+        CrashPrintf("our call: object=0x%llx function=0x%llx (see the CALL breadcrumb below for its name)\r\n",
+                    static_cast<unsigned long long>(g_curCallObj.load(std::memory_order_relaxed)),
+                    static_cast<unsigned long long>(g_curCallFunc.load(std::memory_order_relaxed)));
+    CrashPrintf("hook: silent=%d  guard hits=%llu\r\n", g_hookSilent.load(std::memory_order_relaxed) ? 1 : 0,
+                static_cast<unsigned long long>(g_guardHits.load(std::memory_order_relaxed)));
+    CrashPrintf("regs: RAX=%llx RBX=%llx RCX=%llx RDX=%llx RSI=%llx RDI=%llx RBP=%llx RSP=%llx\r\n",
+                c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->Rsp);
+    CrashPrintf("      R8=%llx R9=%llx R10=%llx R11=%llx R12=%llx R13=%llx R14=%llx R15=%llx RIP=%llx\r\n",
+                c->R8, c->R9, c->R10, c->R11, c->R12, c->R13, c->R14, c->R15, c->Rip);
+
+    if (!stackOverflow)   // a stack walk needs stack, and an overflow has none left
+    {
+        uint64_t frames[24];
+        const int count = WalkStack(*c, frames, 24);
+        CrashPrintf("stack (%d frames):\r\n", count);
+        for (int i = 0; i < count; ++i)
+        {
+            DescribeAddress(frames[i], where, sizeof(where));
+            CrashPrintf("  #%02d %s\r\n", i, where);
+        }
+    }
+
+    const uint32_t head = g_crumbHead.load(std::memory_order_relaxed);
+    const uint32_t count = head < 40 ? head : 40;
+    const ULONGLONG now = GetTickCount64();
+    CrashPrintf("breadcrumbs (last %u, oldest first):\r\n", count);
+    for (uint32_t k = 0; k < count; ++k)
+    {
+        const Crumb& cr = g_crumbs[(head - count + k) & (CRUMB_SIZE - 1)];
+        CrashPrintf("  +%llums tid=%lu %s %s a=0x%llx b=0x%llx\r\n",
+                    static_cast<unsigned long long>(now >= cr.tick ? now - cr.tick : 0), cr.tid, cr.kind, cr.text,
+                    static_cast<unsigned long long>(cr.a), static_cast<unsigned long long>(cr.b));
+    }
+    CrashPrintf("==== END ====\r\n");
+    FlushFileBuffers(g_crashFile);
+}
+
+static LONG CALLBACK CrashReporterVeh(PEXCEPTION_POINTERS info)
+{
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    switch (code)
+    {
+    case EXCEPTION_ACCESS_VIOLATION: case EXCEPTION_IN_PAGE_ERROR: case EXCEPTION_STACK_OVERFLOW:
+    case EXCEPTION_ILLEGAL_INSTRUCTION: case EXCEPTION_PRIV_INSTRUCTION: case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED: case 0xC0000374: case 0xC0000409:
+        break;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (g_inCrashReporter.exchange(1) != 0)       // an exception inside the reporter itself: do nothing more
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // the same fault address twice within a second (a loop that keeps faulting and being caught) is written once
+    static std::atomic<uint64_t> lastAddr{ 0 };
+    static std::atomic<ULONGLONG> lastMs{ 0 };
+    const uint64_t addr = reinterpret_cast<uint64_t>(info->ExceptionRecord->ExceptionAddress);
+    const ULONGLONG nowMs = GetTickCount64();
+    const bool repeat = lastAddr.load(std::memory_order_relaxed) == addr && nowMs - lastMs.load(std::memory_order_relaxed) < 1000;
+    lastAddr.store(addr, std::memory_order_relaxed);
+    lastMs.store(nowMs, std::memory_order_relaxed);
+
+    if (!repeat && g_crashReports.load(std::memory_order_relaxed) < 80)
+    {
+        const uint32_t number = g_crashReports.fetch_add(1, std::memory_order_relaxed) + 1;
+        __try
+        {
+            WriteCrashReport(info, number);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+    g_inCrashReporter.store(0);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void InstallCrashReporter()
+{
+    std::string path = GetLogPath();
+    const size_t slash = path.find_last_of("\\/");
+    path = (slash == std::string::npos ? std::string() : path.substr(0, slash + 1)) + "dungeons_bridge_crash.log";
+    g_crashFile = CreateFileA(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (g_crashFile != INVALID_HANDLE_VALUE)
+        CrashPrintf("\r\n---- session start  build=%s  features=%s  pid=%lu ----\r\n", kBuildId, kFeatures,
+                    GetCurrentProcessId());
+    PVOID handle = AddVectoredExceptionHandler(0, CrashReporterVeh);   // 0 = AFTER the crash guard's handler
+    LogLine(std::string("CRASH REPORTER: build ") + kBuildId + ", features " + kFeatures +
+            (handle && g_crashFile != INVALID_HANDLE_VALUE ? ", armed (dungeons_bridge_crash.log)."
+                                                           : ", NOT fully armed (handler or log file failed)."));
+}
+
+// ---- Health watch (late part): freeze watchdog ----------------------------------------------------------------------
+// HealthSample() runs every 250 ms on the VoidController thread. It looks at three things:
+//   * the game thread: hkProcessEvent counts every ProcessEvent call the engine makes (dozens per frame). If the count
+//     stops moving for 2.5 s while the hook is active (and the game window is in front), the game thread is stuck.
+//     The first time, the watchdog snapshots WHERE every thread is (top frame, module+offset, thread name when the
+//     OS knows it) and the game thread's whole stack, and writes it as a HANG REPORT into dungeons_bridge_crash.log;
+//     it samples again after +8 s and +25 s so a loop can be told from a wait. A RenderThread sitting in a GPU/driver
+//     wait while the GameThread waits on it is what a black screen caused by the driver looks like.
+//   * our own game calls: one that runs for more than 1.5 s is reported while it is still running (OWNCALL_STUCK) -
+//     if that is the freeze, the culprit is named before the game even dies; slow ones (>= 150 ms) are reported
+//     afterwards (SLOW_CALL, from DrainPendingCalls).
+//   * a level transition (hook silent) that lasts more than 20 s (LONG_TRANSITION).
+// Threads are suspended only for the few microseconds a GetThreadContext takes; nothing is printed while one is.
+struct ThreadSnap { DWORD tid; uint64_t rip; uint64_t rsp; bool ok; };
+
+static int WalkStackGuarded(const CONTEXT& ctx, uint64_t* frames, int maxFrames)
+{
+    int n = 0;
+    __try
+    {
+        n = WalkStack(ctx, frames, maxFrames);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+    return n;
+}
+
+static bool SnapshotThread(DWORD tid, CONTEXT* out)
+{
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!h)
+        return false;
+    bool ok = false;
+    if (SuspendThread(h) != static_cast<DWORD>(-1))
+    {
+        ZeroMemory(out, sizeof(*out));
+        out->ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        ok = GetThreadContext(h, out) != FALSE;
+        ResumeThread(h);
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+typedef HRESULT(WINAPI* GetThreadDescriptionFn)(HANDLE, PWSTR*);
+
+static void ThreadName(DWORD tid, char* out, size_t n)
+{
+    out[0] = 0;
+    static GetThreadDescriptionFn fn = reinterpret_cast<GetThreadDescriptionFn>(
+        GetProcAddress(GetModuleHandleA("kernelbase.dll"), "GetThreadDescription"));
+    if (!fn)
+        return;
+    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    if (!h)
+        return;
+    PWSTR wide = nullptr;
+    if (SUCCEEDED(fn(h, &wide)) && wide)
+    {
+        WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, static_cast<int>(n), nullptr, nullptr);
+        out[n - 1] = 0;
+        LocalFree(wide);
+    }
+    CloseHandle(h);
+}
+
+static void WriteHangSample(DWORD gameTid, ULONGLONG idleMs, bool foreground, int sampleNo)
+{
+    // 1. collect everything first (threads suspended one at a time, briefly, nothing printed meanwhile)
+    static ThreadSnap snaps[64];
+    int snapCount = 0;
+    CONTEXT gameCtx;
+    const bool haveGame = gameTid && SnapshotThread(gameTid, &gameCtx);
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap != INVALID_HANDLE_VALUE)
+    {
+        THREADENTRY32 te;
+        te.dwSize = sizeof(te);
+        const DWORD pid = GetCurrentProcessId();
+        const DWORD self = GetCurrentThreadId();
+        for (BOOL more = Thread32First(snap, &te); more && snapCount < 64; more = Thread32Next(snap, &te))
+        {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self)
+                continue;
+            CONTEXT c;
+            ThreadSnap& t = snaps[snapCount++];
+            t.tid = te.th32ThreadID;
+            t.ok = SnapshotThread(t.tid, &c);
+            t.rip = t.ok ? c.Rip : 0;
+            t.rsp = t.ok ? c.Rsp : 0;
+        }
+        CloseHandle(snap);
+    }
+    uint64_t frames[24];
+    const int frameCount = haveGame ? WalkStackGuarded(gameCtx, frames, 24) : 0;
+
+    // 2. now write it
+    char where[200];
+    CrashPrintf("\r\n==== HANG REPORT sample %d  build=%s  pid=%lu  idle=%llums  foreground=%d ====\r\n", sampleNo, kBuildId,
+                GetCurrentProcessId(), static_cast<unsigned long long>(idleMs), foreground ? 1 : 0);
+    if (haveGame)
+    {
+        DescribeAddress(gameCtx.Rip, where, sizeof(where));
+        CrashPrintf("game thread %lu stuck at: %s\r\n", gameTid, where);
+        CrashPrintf("stack (%d frames):\r\n", frameCount);
+        for (int i = 0; i < frameCount; ++i)
+        {
+            DescribeAddress(frames[i], where, sizeof(where));
+            CrashPrintf("  #%02d %s\r\n", i, where);
+        }
+    }
+    else
+        CrashPrintf("game thread %lu: could not be read\r\n", gameTid);
+    const ULONGLONG callStart = g_curCallStartMs.load(std::memory_order_relaxed);
+    if (callStart)
+        CrashPrintf("our state: OUR game call '%s' has been running for %llu ms\r\n", g_curCallName,
+                    static_cast<unsigned long long>(GetTickCount64() - callStart));
+    else
+        CrashPrintf("our state: no game call of ours in progress; hook silent=%d\r\n",
+                    g_hookSilent.load(std::memory_order_relaxed) ? 1 : 0);
+    CrashPrintf("threads (top frame of each):\r\n");
+    for (int i = 0; i < snapCount; ++i)
+    {
+        char name[64];
+        ThreadName(snaps[i].tid, name, sizeof(name));
+        DescribeAddress(snaps[i].ok ? snaps[i].rip : 0, where, sizeof(where));
+        CrashPrintf("  tid=%lu \"%s\" %s\r\n", snaps[i].tid, name, snaps[i].ok ? where : "(unreadable)");
+    }
+    const uint32_t head = g_crumbHead.load(std::memory_order_relaxed);
+    const uint32_t count = head < 25 ? head : 25;
+    const ULONGLONG now = GetTickCount64();
+    CrashPrintf("breadcrumbs (last %u, oldest first):\r\n", count);
+    for (uint32_t k = 0; k < count; ++k)
+    {
+        const Crumb& cr = g_crumbs[(head - count + k) & (CRUMB_SIZE - 1)];
+        CrashPrintf("  +%llums tid=%lu %s %s a=0x%llx b=0x%llx\r\n",
+                    static_cast<unsigned long long>(now >= cr.tick ? now - cr.tick : 0), cr.tid, cr.kind, cr.text,
+                    static_cast<unsigned long long>(cr.a), static_cast<unsigned long long>(cr.b));
+    }
+    CrashPrintf("==== END ====\r\n");
+    FlushFileBuffers(g_crashFile);
+}
+
+static bool GameWindowIsForeground()
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    return pid == GetCurrentProcessId();
+}
+
+static void HealthSample()
+{
+    static ULONGLONG nextMs = 0, lastChangeMs = 0, stallStartMs = 0, silentReported = 0;
+    static uint64_t lastCount = 0;
+    static int stallSamples = 0;
+    static bool ownCallReported = false;
+    const ULONGLONG now = GetTickCount64();
+    if (now < nextMs)
+        return;
+    nextMs = now + 250;
+
+    const uint64_t count = g_processEventCallCount.load(std::memory_order_relaxed);
+    const bool silent = g_hookSilent.load(std::memory_order_relaxed);
+    if (count != lastCount || silent || lastChangeMs == 0)
+    {
+        if (g_stalled.load(std::memory_order_relaxed) && !silent)
+        {
+            g_stalled.store(false, std::memory_order_relaxed);
+            HealthEventAdd("STALL_END", ("the game thread is running again after " +
+                                         std::to_string((now - stallStartMs) / 1000) + " s").c_str(), now - stallStartMs);
+        }
+        lastCount = count;
+        lastChangeMs = now;
+        stallSamples = 0;
+    }
+    g_lastPeChangeMs.store(lastChangeMs, std::memory_order_relaxed);
+
+    // 1. the game thread stopped
+    const bool foreground = GameWindowIsForeground();
+    const ULONGLONG idle = now - lastChangeMs;
+    const ULONGLONG threshold = foreground ? 2500 : 15000;   // an alt-tabbed game may legitimately idle
+    if (!silent && count > 0 && idle >= threshold)
+    {
+        if (!g_stalled.load(std::memory_order_relaxed))
+        {
+            g_stalled.store(true, std::memory_order_relaxed);
+            stallStartMs = lastChangeMs;
+            HealthEventAdd("STALL", ("the game thread stopped running ProcessEvent (" + std::string(foreground ? "window in front"
+                                      : "window in background") + ") - see HANG REPORT in dungeons_bridge_crash.log").c_str(), idle);
+        }
+        if ((stallSamples == 0 && idle >= threshold) || (stallSamples == 1 && idle >= threshold + 8000) ||
+            (stallSamples == 2 && idle >= threshold + 25000))
+        {
+            WriteHangSample(g_hookThreadId.load(std::memory_order_relaxed), idle, foreground, stallSamples + 1);
+            ++stallSamples;
+        }
+    }
+
+    // 2. one of OUR calls is taking too long right now
+    const ULONGLONG callStart = g_curCallStartMs.load(std::memory_order_relaxed);
+    if (callStart && now - callStart >= 1500)
+    {
+        if (!ownCallReported)
+        {
+            ownCallReported = true;
+            HealthEventAdd("OWNCALL_STUCK", (std::string("our game call '") + g_curCallName + "' has been running for " +
+                                             std::to_string((now - callStart) / 1000) + " s on the game thread").c_str(), now - callStart);
+        }
+    }
+    else if (!callStart)
+        ownCallReported = false;
+
+    // 3. a level transition that never ends
+    if (silent)
+    {
+        const ULONGLONG since = g_silentSince.load(std::memory_order_relaxed);
+        if (since && now - since >= 20000 && silentReported != since)
+        {
+            silentReported = since;
+            HealthEventAdd("LONG_TRANSITION", ("the hook has been silent (level loading) for " +
+                                               std::to_string((now - since) / 1000) + " s").c_str(), now - since);
+        }
+    }
+}
+
 static void InstallCrashGuard()
 {
     char envBuf[16] = { 0 };
@@ -3712,6 +4377,7 @@ static void VoidControllerThread()
     for (;;)
     {
         Sleep(20);
+        HealthSample();   // freeze / stuck-call / endless-transition watchdog (see "Health watch")
 
         // One line a minute: how long the game has been up / in the current
         // level. Two crashes happened ~15 min after a level load - this shows
@@ -3859,6 +4525,7 @@ void SetupHookThread()
 #endif
     g_dllStartTick.store(GetTickCount64());
     WaitForEngineBoot();
+    InstallCrashReporter();   // before everything else that can fail: reports what the rest does wrong
     InstallCrashGuard();   // independent of the hook: works even if MinHook fails below
 
     MH_STATUS initStatus = MH_Initialize();
